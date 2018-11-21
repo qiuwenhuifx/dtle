@@ -380,6 +380,10 @@ func (b *BinlogReader) handleEvent(ev *replication.BinlogEvent, entriesChannel c
 				//b.logger.Debugf("mysql.reader: skip rowsEvent %s.%s %v", rowsEvent.Table.Schema, rowsEvent.Table.Table, b.currentCoordinates.GNO)
 				return nil
 			}
+			if dml == DeleteDML {
+				b.logger.Debugf("skipped_a_delete_event on %v.%v", rowsEvent.Table.Schema, rowsEvent.Table.Table)
+				return nil
+			}
 
 			if dml == NotDML {
 				return fmt.Errorf("Unknown DML type: %s", ev.Header.EventType.String())
