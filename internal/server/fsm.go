@@ -17,9 +17,9 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/ugorji/go/codec"
 
-	log "github.com/actiontech/dtle/internal/logger"
 	"github.com/actiontech/dtle/internal/models"
 	"github.com/actiontech/dtle/internal/server/store"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -50,7 +50,7 @@ type udupFSM struct {
 	evalBroker   *EvalBroker
 	blockedEvals *BlockedEvals
 	logOutput    io.Writer
-	logger       *log.Logger
+	logger       *logrus.Logger
 	state        *store.StateStore
 	timetable    *TimeTable
 
@@ -75,7 +75,7 @@ type snapshotHeader struct {
 
 // NewFSMPath is used to construct a new FSM with a blank store
 func NewFSM(evalBroker *EvalBroker,
-	blocked *BlockedEvals, logOutput io.Writer, logger *log.Logger) (*udupFSM, error) {
+	blocked *BlockedEvals, logOutput io.Writer, logger *logrus.Logger) (*udupFSM, error) {
 	// Create a store store
 	state, err := store.NewStateStore(logOutput)
 	if err != nil {
@@ -268,8 +268,14 @@ func (n *udupFSM) applyStatusUpdate(buf []byte, index uint64) interface{} {
 						if len(out) > 0 {
 							task.NodeID = out[0].ID
 							if task.Type == models.TaskTypeDest {
+								// TODO call-path:
+								// udupFSM.applyStatusUpdate
+								//<- NodeUpdateStatusRequestType
+								//   <- server.Node.UpdateStatus(): UpdateStatus is used to update the status of a client node
+								//      <- (rpc) Client.updateNodeStatus <- Client.registerAndHeartbeat
+								// Why it should be updated and only updated for dest task?
 								for i, t := range job.Tasks {
-									t.Config["NatsAddr"] = out[0].NatsAddr
+									t.Config["NatsAddr"] = out[0].NatsAdvertiseAddr
 									job.Tasks[i] = t
 								}
 							}
@@ -327,7 +333,15 @@ func (n *udupFSM) applyStatusUpdate(buf []byte, index uint64) interface{} {
 
 							}
 							if node.Status == models.NodeStatusDown {
-								alloc.TaskStates[alloc.Task].State = models.TaskStateDead
+								if alloc.TaskStates != nil { // #494
+									if alloc.TaskStates[alloc.Task] != nil {
+										alloc.TaskStates[alloc.Task].State = models.TaskStateDead
+									} else {
+										n.logger.Warnf("DTLE_BUG alloc.TaskStates[alloc.Task] == nil")
+									}
+								} else {
+									n.logger.Warnf("DTLE_BUG alloc.TaskStates == nil")
+								}
 								if err := n.state.UpsertAlloc(index, alloc); err != nil {
 									n.logger.Errorf("server.fsm: UpsertAlloc failed: %v", err)
 									return err
@@ -518,29 +532,35 @@ func (n *udupFSM) applyJobClientUpdate(buf []byte, index uint64) interface{} {
 	for _, ju := range req.JobUpdates {
 		// Check if the job already exists
 		if existing, _ := n.state.JobByID(ws, ju.JobID); existing != nil {
-			if ju.Gtid != "" {
-				existing.ModifyIndex = index
-				existing.JobModifyIndex = index
-				for _, t := range existing.Tasks {
-					t.Config["Gtid"] = ju.Gtid
-					//t.Config["NatsAddr"] = ju.NatsAddr
+			existing.ModifyIndex = index
+			existing.JobModifyIndex = index
+
+			for _, t := range existing.Tasks {
+				{ // these should be updated regardless of task type
+					if ju.Gtid != "" {
+						n.logger.Debugf("*** write gtid %v", ju.Gtid)
+						t.Config["Gtid"] = ju.Gtid
+					}
+
+					if ju.BinlogFile != "" {
+						n.logger.Debugf("*** udupFSM.applyJobClientUpdate. update BinlogFile %v", ju.BinlogFile)
+						t.Config["BinlogFile"] = ju.BinlogFile
+					}
+					if ju.BinlogPos != 0 {
+						n.logger.Debugf("*** udupFSM.applyJobClientUpdate. update BinlogPos %v", ju.BinlogPos)
+						t.Config["BinlogPos"] = ju.BinlogPos
+					}
 				}
-				// Update all the client allocations
-				if err := n.state.UpdateJobFromClient(index, existing); err != nil {
-					n.logger.Errorf("server.fsm: UpdateJobFromClient failed: %v", err)
-					return err
-				}
-			} else {
-				existing.ModifyIndex = index
-				existing.JobModifyIndex = index
-				/*for _, t := range existing.Tasks {
+
+				if t.Type == ju.TaskType {
 					t.Config["NatsAddr"] = ju.NatsAddr
-				}*/
-				// Update all the client allocations
-				if err := n.state.UpdateJobFromClient(index, existing); err != nil {
-					n.logger.Errorf("server.fsm: UpdateJobFromClient failed: %v", err)
-					return err
+
 				}
+			}
+			// Update all the client allocations
+			if err := n.state.UpdateJobFromClient(index, existing); err != nil {
+				n.logger.Errorf("server.fsm: UpdateJobFromClient failed: %v", err)
+				return err
 			}
 		}
 	}

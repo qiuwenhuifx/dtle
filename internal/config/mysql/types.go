@@ -8,7 +8,6 @@ package mysql
 
 import (
 	"fmt"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +28,7 @@ const (
 	DoubleColumnType
 	DecimalColumnType
 	BinaryColumnType
-	TextColumnType
+	TextColumnType // 10
 	JSONColumnType
 
 	DateColumnType
@@ -42,11 +41,12 @@ const (
 	TinytextColumnType
 	TinyintColumnType
 	SmallintColumnType
-	IntColumnType
+	IntColumnType // 20
 	SetColumnType
 	CharColumnType
 	VarcharColumnType
 	BlobColumnType
+	BooleanColumnType
 	// TODO: more type
 )
 
@@ -57,10 +57,13 @@ type TimezoneConvertion struct {
 }
 
 type Column struct {
-	Name               string
+	// Every time you set this, you must also set `EscapedName`.
+	RawName            string
+	EscapedName        string
 	IsUnsigned         bool
 	Charset            string
 	Type               ColumnType
+	Default            interface{}
 	ColumnType         string
 	Key                string
 	TimezoneConversion *TimezoneConvertion
@@ -123,7 +126,8 @@ func (c *Column) ConvertArg(arg interface{}) interface{} {
 func NewColumns(names []string) []Column {
 	result := make([]Column, len(names))
 	for i := range names {
-		result[i].Name = names[i]
+		result[i].RawName = names[i]
+		result[i].EscapedName = EscapeName(names[i])
 	}
 	return result
 }
@@ -144,7 +148,7 @@ func NewEmptyColumnsMap() ColumnsMap {
 func NewColumnsMap(orderedColumns []Column) ColumnsMap {
 	columnsMap := NewEmptyColumnsMap()
 	for i, column := range orderedColumns {
-		columnsMap[column.Name] = i
+		columnsMap[column.RawName] = i
 	}
 	return columnsMap
 }
@@ -189,7 +193,14 @@ func (c *ColumnList) ColumnList() []Column {
 func (c *ColumnList) Names() []string {
 	names := make([]string, len(c.Columns))
 	for i := range c.Columns {
-		names[i] = c.Columns[i].Name
+		names[i] = c.Columns[i].RawName
+	}
+	return names
+}
+func (c *ColumnList) EscapedNames() []string {
+	names := make([]string, len(c.Columns))
+	for i := range c.Columns {
+		names[i] = c.Columns[i].EscapedName
 	}
 	return names
 }
@@ -238,19 +249,11 @@ func (c *ColumnList) String() string {
 	return strings.Join(c.Names(), ",")
 }
 
-func (c *ColumnList) Equals(other *ColumnList) bool {
-	return reflect.DeepEqual(c.Columns, other.Columns)
-}
-
-func (c *ColumnList) EqualsByNames(other *ColumnList) bool {
-	return reflect.DeepEqual(c.Names(), other.Names())
-}
-
 // IsSubsetOf returns 'true' when column names of this list are a subset of
 // another list, in arbitrary order (order agnostic)
 func (c *ColumnList) IsSubsetOf(other *ColumnList) bool {
 	for _, column := range c.Columns {
-		if _, exists := other.Ordinals[column.Name]; !exists {
+		if _, exists := other.Ordinals[column.RawName]; !exists {
 			return false
 		}
 	}
@@ -354,3 +357,20 @@ func (c *ColumnValues) String() string {
 	}
 	return strings.Join(stringValues, ",")
 }
+
+func EscapeName(name string) string {
+	sb := strings.Builder{}
+	sb.WriteByte('`')
+	for i := range name {
+		if name[i] == '`' {
+			sb.WriteByte('`')
+			sb.WriteByte('`')
+		} else {
+			sb.WriteByte(name[i])
+		}
+	}
+	sb.WriteByte('`')
+
+	return sb.String()
+}
+

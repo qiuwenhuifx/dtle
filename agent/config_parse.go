@@ -85,8 +85,12 @@ func parseConfig(result *Config, list *ast.ObjectList) error {
 		"ui",
 		"ui_dir",
 		"log_level",
+		"log_max_size",
+		"log_max_backups",
 		"log_to_stdout",
 		"log_file",
+		"pprof_switch",
+		"pprof_time",
 		"pid_file",
 		"bind_addr",
 		"profile",
@@ -102,6 +106,8 @@ func parseConfig(result *Config, list *ast.ObjectList) error {
 		"consul",
 		"http_api_response_headers",
 		"dtle_schema_name",
+		"jaeger_agent_address",
+		"jaeger_agent_port",
 	}
 	if err := checkHCLKeys(list, valid); err != nil {
 		return multierror.Prefix(err, "config:")

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -122,8 +121,6 @@ func (d *DataSource) String() string {
 }
 
 type MySQLDriverConfig struct {
-	DataDir     string
-	MaxFileSize int64
 	//Ref:http://dev.mysql.com/doc/refman/5.7/en/replication-options-slave.html#option_mysqld_replicate-do-table
 	ReplicateDoDb                       []*DataSource
 	ReplicateIgnoreDb                   []*DataSource
@@ -133,13 +130,9 @@ type MySQLDriverConfig struct {
 	MsgBytesLimit                       int
 	TrafficAgainstLimits                int
 	TotalTransferredBytes               int
-	SkipRenamedColumns                  bool
 	MaxRetries                          int64
 	ChunkSize                           int64
-	niceRatio                           float64
-	MaxLagMillisecondsThrottleThreshold int64
-	maxLoad                             umconf.LoadMap
-	criticalLoad                        umconf.LoadMap
+	SqlFilter                           []string
 	RowsEstimate                        int64
 	DeltaEstimate                       int64
 	TimeZone                            string
@@ -148,8 +141,11 @@ type MySQLDriverConfig struct {
 	GroupTimeout                        int // millisecond
 
 	Gtid                     string
+	BinlogFile               string
+	BinlogPos                int64
 	GtidStart                string
 	AutoGtid                 bool // For internal use. Might be changed without notification.
+	BinlogRelay              bool
 	NatsAddr                 string
 	ParallelWorkers          int
 	ConnectionConfig         *umconf.ConnectionConfig
@@ -163,11 +159,6 @@ type MySQLDriverConfig struct {
 	StartTime                time.Time
 	RowCopyStartTime         time.Time
 	RowCopyEndTime           time.Time
-	LockTablesStartTime      time.Time
-	RenameTablesStartTime    time.Time
-	RenameTablesEndTime      time.Time
-	PointOfInterestTime      time.Time
-	pointOfInterestTimeMutex *sync.Mutex
 	TotalDeltaCopied         int64
 	TotalRowsCopied          int64
 	TotalRowsReplay          int64
@@ -176,9 +167,7 @@ type MySQLDriverConfig struct {
 	ApproveHeterogeneous bool
 	SkipCreateDbTable    bool
 
-	throttleMutex               *sync.Mutex
 	CountingRowsFlag            int64
-	UserCommandedUnpostponeFlag int64
 
 	SkipPrivilegeCheck  bool
 	SkipIncrementalCopy bool
@@ -215,6 +204,9 @@ func (a *MySQLDriverConfig) SetDefault() *MySQLDriverConfig {
 	// TODO temporarily (or permanently) disable homogeneous replication, hetero only.
 	result.ApproveHeterogeneous = true
 
+	if result.ConnectionConfig == nil {
+		result.ConnectionConfig = &umconf.ConnectionConfig{}
+	}
 	if "" == result.ConnectionConfig.Charset {
 		result.ConnectionConfig.Charset = "utf8mb4"
 	}
@@ -234,13 +226,6 @@ func (m *MySQLDriverConfig) MarkRowCopyEndTime() {
 // MarkRowCopyStartTime
 func (m *MySQLDriverConfig) MarkRowCopyStartTime() {
 	m.RowCopyStartTime = time.Now()
-}
-
-func (m *MySQLDriverConfig) TimeSincePointOfInterest() time.Duration {
-	m.pointOfInterestTimeMutex.Lock()
-	defer m.pointOfInterestTimeMutex.Unlock()
-
-	return time.Since(m.PointOfInterestTime)
 }
 
 // ElapsedRowCopyTime returns time since starting to copy chunks of rows
@@ -270,43 +255,25 @@ func (m *MySQLDriverConfig) GetTotalDeltaCopied() int64 {
 	return atomic.LoadInt64(&m.TotalDeltaCopied)
 }
 
-// ElapsedTime returns time since very beginning of the process
-func (m *MySQLDriverConfig) ElapsedTime() time.Duration {
-	return time.Since(m.StartTime)
-}
-
-func (m *MySQLDriverConfig) GetNiceRatio() float64 {
-	//m.throttleMutex.Lock()
-	//defer m.throttleMutex.Unlock()
-
-	return m.niceRatio
-}
-
-func (m *MySQLDriverConfig) GetMaxLoad() umconf.LoadMap {
-	//m.throttleMutex.Lock()
-	//defer m.throttleMutex.Unlock()
-
-	return m.maxLoad.Duplicate()
-}
-
-func (m *MySQLDriverConfig) GetCriticalLoad() umconf.LoadMap {
-	//m.throttleMutex.Lock()
-	//defer m.throttleMutex.Unlock()
-
-	return m.criticalLoad.Duplicate()
-}
-
 // TableName is the table configuration
 // slave restrict replication to a given table
 type DataSource struct {
-	TableSchema string
-	Tables      []*Table
+	TableSchema            string
+	TableSchemaRegex       string
+	TableSchemaRenameRegex string
+	TableSchemaRename      string
+	TableSchemaScope       string
+	Tables                 []*Table
 }
 
 type Table struct {
-	TableName   string
-	TableSchema string
-	Counter     int64
+	TableName         string
+	TableRegex        string
+	TableRename       string
+	TableRenameRegex  string
+	TableSchema       string
+	TableSchemaRename string
+	Counter           int64
 
 	OriginalTableColumns *umconf.ColumnList
 	UseUniqueKey         *umconf.UniqueKey
@@ -324,6 +291,7 @@ type TableContext struct {
 	WhereCtx       *WhereContext
 	DefChangedSent bool
 }
+
 func NewTableContext(table *Table, whereCtx *WhereContext) *TableContext {
 	return &TableContext{
 		Table:          table,

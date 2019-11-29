@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/actiontech/dtle/internal/client/driver/common"
+
 	mysqlDriver "github.com/actiontech/dtle/internal/client/driver/mysql"
 	"github.com/actiontech/dtle/internal/config/mysql"
 
@@ -24,11 +26,13 @@ import (
 	"encoding/binary"
 	"strings"
 
+	"time"
+
 	"github.com/actiontech/dtle/internal/client/driver/mysql/binlog"
 	"github.com/actiontech/dtle/internal/config"
-	log "github.com/actiontech/dtle/internal/logger"
 	"github.com/actiontech/dtle/internal/models"
 	"github.com/actiontech/dtle/utils"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -38,7 +42,7 @@ const (
 )
 
 type KafkaRunner struct {
-	logger      *log.Entry
+	logger      *logrus.Entry
 	subject     string
 	subjectUUID uuid.UUID
 	natsConn    *gonats.Conn
@@ -53,12 +57,12 @@ type KafkaRunner struct {
 	tables map[string](map[string]*config.Table)
 }
 
-func NewKafkaRunner(subject, tp string, maxPayload int, cfg *KafkaConfig, logger *log.Logger) *KafkaRunner {
-	entry := log.NewEntry(logger).WithFields(log.Fields{
-		"job": subject,
+func NewKafkaRunner(execCtx *common.ExecContext, cfg *KafkaConfig, logger *logrus.Logger) *KafkaRunner {
+	entry := logger.WithFields(logrus.Fields{
+		"job": execCtx.Subject,
 	})
 	return &KafkaRunner{
-		subject:     subject,
+		subject:     execCtx.Subject,
 		kafkaConfig: cfg,
 		logger:      entry,
 		waitCh:      make(chan *models.WaitResult, 1),
@@ -70,12 +74,12 @@ func (kr *KafkaRunner) ID() string {
 	id := config.DriverCtx{
 		// TODO
 		DriverConfig: &config.MySQLDriverConfig{
-		//ReplicateDoDb:     a.mysqlContext.ReplicateDoDb,
-		//ReplicateIgnoreDb: a.mysqlContext.ReplicateIgnoreDb,
-		//Gtid:              a.mysqlContext.Gtid,
-		//NatsAddr:          a.mysqlContext.NatsAddr,
-		//ParallelWorkers:   a.mysqlContext.ParallelWorkers,
-		//ConnectionConfig:  a.mysqlContext.ConnectionConfig,
+			//ReplicateDoDb:     a.mysqlContext.ReplicateDoDb,
+			//ReplicateIgnoreDb: a.mysqlContext.ReplicateIgnoreDb,
+			//Gtid:              a.mysqlContext.Gtid,
+			//NatsAddr:          a.mysqlContext.NatsAddr,
+			//ParallelWorkers:   a.mysqlContext.ParallelWorkers,
+			//ConnectionConfig:  a.mysqlContext.ConnectionConfig,
 		},
 	}
 
@@ -112,27 +116,38 @@ func (kr *KafkaRunner) initNatSubClient() (err error) {
 	natsAddr := fmt.Sprintf("nats://%s", kr.kafkaConfig.NatsAddr)
 	sc, err := gonats.Connect(natsAddr)
 	if err != nil {
-		kr.logger.Errorf("kafka: Can't connect nats server %v. make sure a nats streaming server is running.%v", natsAddr, err)
+		kr.logger.WithFields(logrus.Fields{
+			"err":        err,
+			"natsServer": natsAddr,
+		}).Errorf("kafka: Can't connect nats server. make sure a nats streaming server is running")
 		return err
 	}
-	kr.logger.Debugf("kafka: Connect nats server %v", natsAddr)
+	kr.logger.WithFields(logrus.Fields{
+		"natsServer": natsAddr,
+	}).Debugf("kafka: Connect nats server %v", natsAddr)
 	kr.natsConn = sc
 	return nil
 }
 func (kr *KafkaRunner) Run() {
-	kr.logger.Debugf("kafka. broker: %v", kr.kafkaConfig.Brokers)
+	kr.logger.WithFields(logrus.Fields{
+		"broker": kr.kafkaConfig.Brokers,
+	}).Debugf("kafka. broker: %v", kr.kafkaConfig.Brokers)
 
 	var err error
 	kr.kafkaMgr, err = NewKafkaManager(kr.kafkaConfig)
 	if err != nil {
-		kr.logger.Errorf("failed to initialize kafka: %v", err.Error())
+		kr.logger.WithFields(logrus.Fields{
+			"err": err.Error(),
+		}).Errorf("failed to initialize kafka")
 		kr.onError(TaskStateDead, err)
 		return
 	}
 
 	err = kr.initNatSubClient()
 	if err != nil {
-		kr.logger.Errorf("initNatSubClient error: %v", err.Error())
+		kr.logger.WithFields(logrus.Fields{
+			"err": err.Error(),
+		}).Errorf("initNatSubClient error")
 		kr.onError(TaskStateDead, err)
 		return
 	}
@@ -154,13 +169,19 @@ func (kr *KafkaRunner) getOrSetTable(schemaName string, tableName string, table 
 	if table == nil {
 		b, ok := a[tableName]
 		if ok {
-			kr.logger.Debugf("kafka: reuse table info %v.%v", schemaName, tableName)
+			kr.logger.WithFields(logrus.Fields{
+				"schemaName": schemaName,
+				"tableName":  tableName,
+			}).Debugf("kafka: reuse table info ")
 			return b, nil
 		} else {
 			return nil, fmt.Errorf("DTLE_BUG kafka: unknown table structure")
 		}
 	} else {
-		kr.logger.Debugf("kafka: new table info %v.%v", schemaName, tableName)
+		kr.logger.WithFields(logrus.Fields{
+			"schemaName": schemaName,
+			"tableName":  tableName,
+		}).Debugf("kafka: new table info")
 		a[tableName] = table
 		return table, nil
 	}
@@ -171,19 +192,34 @@ func (kr *KafkaRunner) initiateStreaming() error {
 
 	_, err = kr.natsConn.Subscribe(fmt.Sprintf("%s_full", kr.subject), func(m *gonats.Msg) {
 		kr.logger.Debugf("kafka: recv a msg")
-		dumpData := &mysqlDriver.DumpEntry{}
-		if err := Decode(m.Data, dumpData); err != nil {
+		dumpData, err := mysqlDriver.DecodeDumpEntry(m.Data)
+		if err != nil {
 			kr.onError(TaskStateDead, err)
 			return
 		}
 
 		if dumpData.DbSQL != "" || len(dumpData.TbSQL) > 0 {
 			kr.logger.Debugf("kafka. a sql dumpEntry")
+		} else if dumpData.TableSchema == "" && dumpData.TableName == "" {
+			kr.logger.Debugf("kafka.  skip apply sqlMode and SystemVariablesStatement")
+			if err := kr.natsConn.Publish(m.Reply, nil); err != nil {
+				kr.onError(TaskStateDead, err)
+				return
+			}
+			return
 		} else {
-			// TODO cache table
-			table, err := kr.getOrSetTable(dumpData.TableSchema, dumpData.TableName, dumpData.Table)
+			var tableFromDumpData *config.Table = nil
+			if len(dumpData.Table) > 0 {
+				tableFromDumpData = &config.Table{}
+				err = DecodeGob(dumpData.Table, tableFromDumpData)
+				if err != nil {
+					kr.onError(TaskStateDead, err)
+					return
+				}
+			}
+			table, err := kr.getOrSetTable(dumpData.TableSchema, dumpData.TableName, tableFromDumpData)
 			if err != nil {
-				kr.onError(TaskStateDead, fmt.Errorf("DTLE_BUG kafka: unknown table structure"))
+				kr.onError(TaskStateDead, err)
 				return
 			}
 
@@ -209,6 +245,9 @@ func (kr *KafkaRunner) initiateStreaming() error {
 			kr.onError(TaskStateDead, err)
 		}
 	})
+	if err != nil {
+		return err
+	}
 
 	_, err = kr.natsConn.Subscribe(fmt.Sprintf("%s_incr_hete", kr.subject), func(m *gonats.Msg) {
 		var binlogEntries binlog.BinlogEntries
@@ -223,7 +262,9 @@ func (kr *KafkaRunner) initiateStreaming() error {
 		if err := kr.natsConn.Publish(m.Reply, nil); err != nil {
 			kr.onError(TaskStateDead, err)
 		}
-		kr.logger.Debugf("applier. incr. ack-recv. nEntries: %v", len(binlogEntries.Entries))
+		kr.logger.WithFields(logrus.Fields{
+			"nEntries": len(binlogEntries.Entries),
+		}).Debugf("applier. incr. ack-recv. nEntries")
 	})
 	if err != nil {
 		return err
@@ -241,6 +282,9 @@ func Decode(data []byte, vPtr interface{}) (err error) {
 
 	return gob.NewDecoder(bytes.NewBuffer(msg)).Decode(vPtr)
 }
+func DecodeGob(data []byte, vPtr interface{}) (err error) {
+	return gob.NewDecoder(bytes.NewBuffer(data)).Decode(vPtr)
+}
 
 func (kr *KafkaRunner) onError(state int, err error) {
 	if kr.shutdown {
@@ -252,13 +296,17 @@ func (kr *KafkaRunner) onError(state int, err error) {
 	case TaskStateRestart:
 		if kr.natsConn != nil {
 			if err := kr.natsConn.Publish(fmt.Sprintf("%s_restart", kr.subject), []byte(kr.kafkaConfig.Gtid)); err != nil {
-				kr.logger.Errorf("kafka: Trigger restart: %v", err)
+				kr.logger.WithFields(logrus.Fields{
+					"err": err,
+				}).Errorf("kafka: Trigger restart")
 			}
 		}
 	default:
 		if kr.natsConn != nil {
 			if err := kr.natsConn.Publish(fmt.Sprintf("%s_error", kr.subject), []byte(kr.kafkaConfig.Gtid)); err != nil {
-				kr.logger.Errorf("kafka: Trigger shutdown: %v", err)
+				kr.logger.WithFields(logrus.Fields{
+					"err": err,
+				}).Errorf("kafka: Trigger shutdown")
 			}
 		}
 	}
@@ -271,10 +319,11 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 	var err error
 
 	tableIdent := fmt.Sprintf("%v.%v.%v", kr.kafkaMgr.Cfg.Topic, table.TableSchema, table.TableName)
-	kr.logger.Debugf("kafka: kafkaTransformSnapshotData value: %v", value.ValuesX)
+	kr.logger.WithFields(logrus.Fields{
+		"value": value.ValuesX,
+	}).Debugf("kafka: kafkaTransformSnapshotData value")
 	for _, rowValues := range value.ValuesX {
 		keyPayload := NewRow()
-
 		valuePayload := NewValuePayload()
 		valuePayload.Source.Version = "0.0.1"
 		valuePayload.Source.Name = kr.kafkaMgr.Cfg.Topic
@@ -283,12 +332,13 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 		valuePayload.Source.Gtid = nil
 		valuePayload.Source.File = ""
 		valuePayload.Source.Pos = 0
-		valuePayload.Source.Row = 1 // TODO "the row within the event (if there is more than one)".
+		valuePayload.Source.Row = 0 // TODO "the row within the event (if there is more than one)".
 		valuePayload.Source.Snapshot = true
 		valuePayload.Source.Thread = nil // TODO
 		valuePayload.Source.Db = table.TableSchema
 		valuePayload.Source.Table = table.TableName
 		valuePayload.Op = RECORD_OP_INSERT
+		valuePayload.Source.Query = nil
 		valuePayload.TsMs = utils.CurrentTimeMillis()
 
 		valuePayload.Before = nil
@@ -301,9 +351,8 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 		for i, _ := range columnList {
 			var value interface{}
 
-			if *rowValues[i] != nil {
-				valueStr := string((*rowValues[i]).([]byte))
-
+			if rowValues[i] != nil {
+				valueStr := string(*rowValues[i])
 				switch columnList[i].Type {
 				case mysql.TinyintColumnType, mysql.SmallintColumnType, mysql.MediumIntColumnType, mysql.IntColumnType:
 					value, err = strconv.ParseInt(valueStr, 10, 64)
@@ -323,7 +372,12 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 							return err
 						}
 					}
-				case mysql.FloatColumnType, mysql.DoubleColumnType:
+				case mysql.DoubleColumnType:
+					value, err = strconv.ParseFloat(valueStr, 64)
+					if err != nil {
+						return err
+					}
+				case mysql.FloatColumnType:
 					value, err = strconv.ParseFloat(valueStr, 64)
 					if err != nil {
 						return err
@@ -331,7 +385,33 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 				case mysql.DecimalColumnType:
 					value = DecimalValueFromStringMysql(valueStr)
 				case mysql.TimeColumnType:
-					value = TimeValue(valueStr)
+					if valueStr != "" && columnList[i].ColumnType == "timestamp" {
+						value = valueStr[:10] + "T" + valueStr[11:] + "Z"
+					} else {
+						value = TimeValue(valueStr)
+					}
+
+				case mysql.BinaryColumnType:
+					value = base64.StdEncoding.EncodeToString([]byte(valueStr))
+				case mysql.BitColumnType:
+					value = base64.StdEncoding.EncodeToString([]byte(valueStr))
+				case mysql.BlobColumnType:
+					value = base64.StdEncoding.EncodeToString([]byte(valueStr))
+				case mysql.VarbinaryColumnType:
+					value = base64.StdEncoding.EncodeToString([]byte(valueStr))
+				case mysql.DateColumnType, mysql.DateTimeColumnType:
+					if valueStr != "" && columnList[i].ColumnType == "datetime" {
+						value = DateTimeValue(valueStr)
+					} else if valueStr != "" {
+						value = DateValue(valueStr)
+					}
+
+				case mysql.YearColumnType:
+					if valueStr != "" {
+						value = YearValue(valueStr)
+					} else {
+						value = valueStr
+					}
 				default:
 					value = valueStr
 				}
@@ -340,11 +420,13 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 			}
 
 			if columnList[i].IsPk() {
-				keyPayload.AddField(columnList[i].Name, value)
+				keyPayload.AddField(columnList[i].RawName, value)
 			}
 
-			kr.logger.Debugf("kafka: kafkaTransformSnapshotData rowvalue: %v", value)
-			valuePayload.After.AddField(columnList[i].Name, value)
+			kr.logger.WithFields(logrus.Fields{
+				"rowvalue": value,
+			}).Debugf("kafka: kafkaTransformSnapshotData rowvalue")
+			valuePayload.After.AddField(columnList[i].RawName, value)
 		}
 
 		valueSchema := NewEnvelopeSchema(tableIdent, valueColDef)
@@ -366,7 +448,7 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 		if err != nil {
 			return fmt.Errorf("kafka: serialization error: %v", err)
 		}
-
+		//vBs = []byte(strings.Replace(string(vBs), "\"field\":\"snapshot\"", "\"default\":false,\"field\":\"snapshot\"", -1))
 		err = kr.kafkaMgr.Send(tableIdent, kBs, vBs)
 		if err != nil {
 			return err
@@ -379,7 +461,6 @@ func (kr *KafkaRunner) kafkaTransformSnapshotData(table *config.Table, value *my
 func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry) (err error) {
 	for i, _ := range dmlEvent.Events {
 		dataEvent := &dmlEvent.Events[i]
-
 		// this must be executed before skipping DDL
 		table, err := kr.getOrSetTable(dataEvent.DatabaseName, dataEvent.TableName, dataEvent.Table)
 		if err != nil {
@@ -417,7 +498,7 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 		colDefs, keyColDefs := kafkaColumnListToColDefs(table.OriginalTableColumns)
 
 		for i, _ := range colList {
-			colName := colList[i].Name
+			colName := colList[i].RawName
 
 			var beforeValue interface{}
 			var afterValue interface{}
@@ -450,23 +531,23 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 			case mysql.TimeColumnType, mysql.TimestampColumnType:
 				if beforeValue != nil && colList[i].ColumnType == "timestamp" {
 					beforeValue = beforeValue.(string)[:10] + "T" + beforeValue.(string)[11:] + "Z"
-				} else {
+				} else if beforeValue != nil {
 					beforeValue = TimeValue(beforeValue.(string))
 				}
 				if afterValue != nil && colList[i].ColumnType == "timestamp" {
 					afterValue = afterValue.(string)[:10] + "T" + afterValue.(string)[11:] + "Z"
-				} else {
+				} else if afterValue != nil {
 					afterValue = TimeValue(afterValue.(string))
 				}
 			case mysql.DateColumnType, mysql.DateTimeColumnType:
 				if beforeValue != nil && colList[i].ColumnType == "datetime" {
 					beforeValue = DateTimeValue(beforeValue.(string))
-				} else {
+				} else if beforeValue != nil {
 					beforeValue = DateValue(beforeValue.(string))
 				}
 				if afterValue != nil && colList[i].ColumnType == "datetime" {
 					afterValue = DateTimeValue(afterValue.(string))
-				} else {
+				} else if afterValue != nil {
 					afterValue = DateValue(afterValue.(string))
 				}
 			case mysql.VarbinaryColumnType:
@@ -510,12 +591,10 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 			case mysql.SetColumnType:
 				columnType := colList[i].ColumnType
 				if beforeValue != nil {
-					num := beforeValue.(int64)
-					beforeValue = getSetValue(num, columnType)
+					beforeValue = getSetValue(beforeValue.(int64), columnType)
 				}
 				if afterValue != nil {
-					num := afterValue.(int64)
-					afterValue = getSetValue(num, columnType)
+					afterValue = getSetValue(afterValue.(int64), columnType)
 				}
 
 			case mysql.BitColumnType:
@@ -540,11 +619,15 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 			}
 
 			if before != nil {
-				kr.logger.Debugf("kafka. beforeValue: type: %T, value: %v", beforeValue, beforeValue)
+				kr.logger.WithFields(logrus.Fields{
+					"beforeValue": beforeValue,
+				}).Debugf("kafka. beforeValue")
 				before.AddField(colName, beforeValue)
 			}
 			if after != nil {
-				kr.logger.Debugf("kafka. afterValue: type: %T, value: %v", afterValue, afterValue)
+				kr.logger.WithFields(logrus.Fields{
+					"afterValue": afterValue,
+				}).Debugf("kafka. afterValue")
 				after.AddField(colName, afterValue)
 			}
 		}
@@ -555,13 +638,15 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 
 		valuePayload.Source.Version = "0.0.1"
 		valuePayload.Source.Name = kr.kafkaMgr.Cfg.Topic
-		valuePayload.Source.ServerID = 0 // TODO
-		valuePayload.Source.TsSec = 0    // TODO the timestamp in seconds
+		valuePayload.Source.ServerID = 1 // TODO
+		valuePayload.Source.TsSec = time.Now().Unix()
 		valuePayload.Source.Gtid = dmlEvent.Coordinates.GetGtidForThisTx()
 		valuePayload.Source.File = dmlEvent.Coordinates.LogFile
 		valuePayload.Source.Pos = dataEvent.LogPos
-		valuePayload.Source.Row = 1          // TODO "the row within the event (if there is more than one)".
+		valuePayload.Source.Row = 0          // TODO "the row within the event (if there is more than one)".
 		valuePayload.Source.Snapshot = false // TODO "whether this event was part of a snapshot"
+
+		valuePayload.Source.Query = nil
 		// My guess: for full range, snapshot=true, else false
 		valuePayload.Source.Thread = nil // TODO
 		valuePayload.Source.Db = dataEvent.DatabaseName
@@ -588,7 +673,7 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 		if err != nil {
 			return err
 		}
-
+		//	vBs = []byte(strings.Replace(string(vBs), "\"field\":\"snapshot\"", "\"default\":false,\"field\":\"snapshot\"", -1))
 		err = kr.kafkaMgr.Send(tableIdent, kBs, vBs)
 		if err != nil {
 			return err
@@ -617,6 +702,9 @@ func (kr *KafkaRunner) kafkaTransformDMLEventQuery(dmlEvent *binlog.BinlogEntry)
 }
 
 func getSetValue(num int64, set string) string {
+	if num == 0 {
+		return ""
+	}
 	value := ""
 	sets := strings.Split(set[5:len(set)-1], ",")
 	for i := 0; i < len(sets); i++ {
@@ -637,9 +725,6 @@ func getBinaryValue(binary string, value string) string {
 		return ""
 	}
 	valueLen := len(value)
-	for i := 0; i < lens-valueLen; i++ {
-		value = value + "\u0000"
-	}
 	var buffer bytes.Buffer
 	buffer.Write([]byte(value))
 	if lens-valueLen > 0 {
@@ -657,82 +742,89 @@ func getBitValue(bit string, value int64) string {
 	var buf = make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, uint64(value))
 
-	return base64.StdEncoding.EncodeToString(buf[0:bitNumber])
+	return base64.StdEncoding.EncodeToString(buf[8-bitNumber:])
 }
 
 func kafkaColumnListToColDefs(colList *mysql.ColumnList) (valColDefs ColDefs, keyColDefs ColDefs) {
 	cols := colList.ColumnList()
 	for i, _ := range cols {
 		var field *Schema
-
+		defaultValue := cols[i].Default
+		if defaultValue == "" {
+			defaultValue = nil
+		}
 		optional := cols[i].Nullable
-		fieldName := cols[i].Name
-
+		fieldName := cols[i].RawName
 		switch cols[i].Type {
 		case mysql.UnknownColumnType:
 			// TODO warning
-			field = NewSimpleSchemaField("", optional, fieldName)
+			field = NewSimpleSchemaWithDefaultField("", optional, fieldName, defaultValue)
 
 		case mysql.BitColumnType:
-			fallthrough
+			field = NewBitsField(optional, fieldName, cols[i].ColumnType[4:len(cols[i].ColumnType)-1], defaultValue)
 		case mysql.BlobColumnType:
-			fallthrough
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_BYTES, optional, fieldName, defaultValue)
 		case mysql.BinaryColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_STRING, optional, fieldName)
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_BYTES, optional, fieldName, defaultValue)
 		case mysql.VarbinaryColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_BYTES, optional, fieldName)
-
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_BYTES, optional, fieldName, defaultValue)
 		case mysql.TextColumnType:
 			fallthrough
 		case mysql.CharColumnType:
 			fallthrough
 		case mysql.VarcharColumnType:
-			fallthrough
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_STRING, optional, fieldName, defaultValue)
 		case mysql.EnumColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_STRING, optional, fieldName)
-
+			field = NewEnumField(SCHEMA_TYPE_STRING, optional, fieldName, cols[i].ColumnType, defaultValue)
+		case mysql.SetColumnType:
+			field = NewSetField(SCHEMA_TYPE_STRING, optional, fieldName, cols[i].ColumnType, defaultValue)
 		case mysql.TinyintColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_INT16, optional, fieldName)
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT16, optional, fieldName, defaultValue)
+		case mysql.TinytextColumnType:
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_STRING, optional, fieldName, defaultValue)
 		case mysql.SmallintColumnType:
 			if cols[i].IsUnsigned {
-				field = NewSimpleSchemaField(SCHEMA_TYPE_INT32, optional, fieldName)
+				field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT32, optional, fieldName, defaultValue)
 			} else {
-				field = NewSimpleSchemaField(SCHEMA_TYPE_INT16, optional, fieldName)
+				field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT16, optional, fieldName, defaultValue)
 			}
 		case mysql.MediumIntColumnType: // 24 bit in mysql
-			field = NewSimpleSchemaField(SCHEMA_TYPE_INT32, optional, fieldName)
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT32, optional, fieldName, defaultValue)
 		case mysql.IntColumnType:
 			if cols[i].IsUnsigned {
-				field = NewSimpleSchemaField(SCHEMA_TYPE_INT64, optional, fieldName)
+				field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT64, optional, fieldName, defaultValue)
 			} else {
-				field = NewSimpleSchemaField(SCHEMA_TYPE_INT32, optional, fieldName)
+				field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT32, optional, fieldName, defaultValue)
 			}
 		case mysql.BigIntColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_INT64, optional, fieldName)
-
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_INT64, optional, fieldName, defaultValue)
 		case mysql.FloatColumnType:
-			fallthrough
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_FLOAT64, optional, fieldName, defaultValue)
 		case mysql.DoubleColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_FLOAT64, optional, fieldName)
-
+			field = NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_FLOAT64, optional, fieldName, defaultValue)
 		case mysql.DecimalColumnType:
-			field = NewDecimalField(cols[i].Precision, cols[i].Scale, optional, fieldName)
-
-		case mysql.TimestampColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_INT64, optional, fieldName)
+			field = NewDecimalField(cols[i].Precision, cols[i].Scale, optional, fieldName, defaultValue)
 		case mysql.DateColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_INT32, optional, fieldName)
+			if cols[i].ColumnType == "datetime" {
+				field = NewDateTimeField(optional, fieldName, defaultValue)
+			} else {
+				field = NewDateField(SCHEMA_TYPE_INT32, optional, fieldName, defaultValue)
+			}
 		case mysql.YearColumnType:
-			field = NewSimpleSchemaField(SCHEMA_TYPE_INT32, optional, fieldName)
+			field = NewYearField(SCHEMA_TYPE_INT32, optional, fieldName, defaultValue)
 		case mysql.DateTimeColumnType:
-			field = NewDateTimeField(optional, fieldName)
+			field = NewDateTimeField(optional, fieldName, defaultValue)
 		case mysql.TimeColumnType:
-			field = NewTimeField(optional, fieldName)
+			if cols[i].ColumnType == "timestamp" {
+				field = NewTimeStampField(SCHEMA_TYPE_STRING, optional, fieldName, defaultValue)
+			} else {
+				field = NewTimeField(optional, fieldName, defaultValue)
+			}
 		case mysql.JSONColumnType:
 			field = NewJsonField(optional, fieldName)
 		default:
 			// TODO report a BUG
-			field = NewSimpleSchemaField("", optional, fieldName)
+			field = NewSimpleSchemaWithDefaultField("", optional, fieldName, defaultValue)
 		}
 
 		addToKey := cols[i].IsPk()

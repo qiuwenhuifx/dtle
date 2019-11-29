@@ -9,7 +9,6 @@ package sql
 import (
 	"bytes"
 	"fmt"
-	"strconv"
 	"strings"
 
 	umconf "github.com/actiontech/dtle/internal/config/mysql"
@@ -27,19 +26,9 @@ const (
 	NotEqualsComparisonSign                               = "!="
 )
 
-// EscapeName will escape a db/table/column/... name by wrapping with backticks.
-// It is not fool proof. I'm just trying to do the right thing here, not solving
-// SQL injection issues, which should be irrelevant for this tool.
-func EscapeName(name string) string {
-	if unquoted, err := strconv.Unquote(name); err == nil {
-		name = unquoted
-	}
-	return fmt.Sprintf("`%s`", name)
-}
-
-func EscapeColRawToString(col *interface{}) string {
-	if *col != nil {
-		return fmt.Sprintf("'%s'", EscapeValue(string((*col).([]byte))))
+func EscapeColRawToString(col *[]byte) string {
+	if col != nil {
+		return fmt.Sprintf("'%s'", EscapeValue(string(*col)))
 	} else {
 		return "NULL"
 	}
@@ -96,14 +85,14 @@ func duplicateNames(names []string) []string {
 	return duplicate
 }
 
-func BuildValueComparison(column string, value string, comparisonSign ValueComparisonSign) (result string, err error) {
-	if column == "" {
+func BuildValueComparison(columnEscaped string, value string, comparisonSign ValueComparisonSign) (result string, err error) {
+	if columnEscaped == "``" {
 		return "", fmt.Errorf("Empty column in GetValueComparison")
 	}
 	if value == "" {
 		return "", fmt.Errorf("Empty value in GetValueComparison")
 	}
-	comparison := fmt.Sprintf("(%s %s %s)", EscapeName(column), string(comparisonSign), value)
+	comparison := fmt.Sprintf("(%s %s %s)", columnEscaped, string(comparisonSign), value)
 	return comparison, err
 }
 
@@ -115,37 +104,37 @@ func BuildSetPreparedClause(columns *umconf.ColumnList) (result string, err erro
 	for _, column := range columns.ColumnList() {
 		var setToken string
 		if column.TimezoneConversion != nil {
-			setToken = fmt.Sprintf("%s=convert_tz(?, '%s', '%s')", EscapeName(column.Name), column.TimezoneConversion.ToTimezone, "+00:00")
+			setToken = fmt.Sprintf("%s=convert_tz(?, '%s', '%s')", column.EscapedName, column.TimezoneConversion.ToTimezone, "+00:00")
 		} else {
-			setToken = fmt.Sprintf("%s=?", EscapeName(column.Name))
+			setToken = fmt.Sprintf("%s=?", column.EscapedName)
 		}
 		setTokens = append(setTokens, setToken)
 	}
 	return strings.Join(setTokens, ", "), nil
 }
 
-func BuildDMLDeleteQuery(databaseName, tableName string, tableColumns *umconf.ColumnList, args []*interface{}) (result string, columnArgs []interface{}, err error) {
+func BuildDMLDeleteQuery(databaseName, tableName string, tableColumns *umconf.ColumnList, args []*interface{}) (result string, columnArgs []interface{}, hasUK bool, err error) {
 	if len(args) < tableColumns.Len() {
-		return result, columnArgs, fmt.Errorf("args count differs from table column count in BuildDMLDeleteQuery %v, %v",
+		return result, columnArgs, hasUK, fmt.Errorf("args count differs from table column count in BuildDMLDeleteQuery %v, %v",
 			len(args), tableColumns.Len())
 	}
 	comparisons := []string{}
 	uniqueKeyComparisons := []string{}
 	uniqueKeyArgs := make([]interface{}, 0)
 	for _, column := range tableColumns.ColumnList() {
-		tableOrdinal := tableColumns.Ordinals[column.Name]
+		tableOrdinal := tableColumns.Ordinals[column.RawName]
 		if *args[tableOrdinal] == nil {
-			comparison, err := BuildValueComparison(column.Name, "NULL", IsEqualsComparisonSign)
+			comparison, err := BuildValueComparison(column.EscapedName, "NULL", IsEqualsComparisonSign)
 			if err != nil {
-				return result, columnArgs, err
+				return result, columnArgs, hasUK, err
 			}
 			comparisons = append(comparisons, comparison)
 		} else {
-			if strings.HasPrefix(column.ColumnType, "binary") {
+			if column.Type == umconf.BinaryColumnType {
 				arg := column.ConvertArg(*args[tableOrdinal])
-				comparison, err := BuildValueComparison(column.Name, fmt.Sprintf("cast('%v' as %s)", arg, column.ColumnType), EqualsComparisonSign)
+				comparison, err := BuildValueComparison(column.EscapedName, fmt.Sprintf("cast('%v' as %s)", arg, column.ColumnType), EqualsComparisonSign)
 				if err != nil {
-					return result, columnArgs, err
+					return result, columnArgs, hasUK, err
 				}
 				if strings.ToUpper(column.Key) == "PRI" {
 					uniqueKeyComparisons = append(uniqueKeyComparisons, comparison)
@@ -154,9 +143,9 @@ func BuildDMLDeleteQuery(databaseName, tableName string, tableColumns *umconf.Co
 				}
 			} else {
 				arg := column.ConvertArg(*args[tableOrdinal])
-				comparison, err := BuildValueComparison(column.Name, "?", EqualsComparisonSign)
+				comparison, err := BuildValueComparison(column.EscapedName, "?", EqualsComparisonSign)
 				if err != nil {
-					return result, columnArgs, err
+					return result, columnArgs, hasUK, err
 				}
 				if strings.ToUpper(column.Key) == "PRI" {
 					uniqueKeyArgs = append(uniqueKeyArgs, arg)
@@ -169,15 +158,15 @@ func BuildDMLDeleteQuery(databaseName, tableName string, tableColumns *umconf.Co
 		}
 	}
 	if len(uniqueKeyComparisons) > 0 {
+		hasUK = true
 		comparisons = uniqueKeyComparisons
-	}
-	if len(uniqueKeyArgs) > 0 {
 		columnArgs = uniqueKeyArgs
 	}
-	databaseName = EscapeName(databaseName)
-	tableName = EscapeName(tableName)
+
+	databaseName = umconf.EscapeName(databaseName)
+	tableName = umconf.EscapeName(tableName)
 	if err != nil {
-		return result, columnArgs, err
+		return result, columnArgs, hasUK, err
 	}
 	result = fmt.Sprintf(`
 			delete
@@ -188,7 +177,7 @@ func BuildDMLDeleteQuery(databaseName, tableName string, tableColumns *umconf.Co
 		`, databaseName, tableName,
 		fmt.Sprintf("(%s)", strings.Join(comparisons, " and ")),
 	)
-	return result, columnArgs, nil
+	return result, columnArgs, hasUK, nil
 }
 
 func BuildDMLInsertQuery(databaseName, tableName string, tableColumns, sharedColumns, mappedSharedColumns *umconf.ColumnList, args []*interface{}) (result string, sharedArgs []interface{}, err error) {
@@ -203,11 +192,11 @@ func BuildDMLInsertQuery(databaseName, tableName string, tableColumns, sharedCol
 	if sharedColumns.Len() == 0 {
 		return result, sharedArgs, fmt.Errorf("No shared columns found in BuildDMLInsertQuery")
 	}
-	databaseName = EscapeName(databaseName)
-	tableName = EscapeName(tableName)
+	databaseName = umconf.EscapeName(databaseName)
+	tableName = umconf.EscapeName(tableName)
 
 	for _, column := range tableColumns.ColumnList() {
-		tableOrdinal := tableColumns.Ordinals[column.Name]
+		tableOrdinal := tableColumns.Ordinals[column.RawName]
 		if *args[tableOrdinal] == nil {
 			sharedArgs = append(sharedArgs, *args[tableOrdinal])
 		} else {
@@ -216,10 +205,7 @@ func BuildDMLInsertQuery(databaseName, tableName string, tableColumns, sharedCol
 		}
 	}
 
-	mappedSharedColumnNames := duplicateNames(tableColumns.Names())
-	for i := range mappedSharedColumnNames {
-		mappedSharedColumnNames[i] = EscapeName(mappedSharedColumnNames[i])
-	}
+	mappedSharedColumnNames := duplicateNames(tableColumns.EscapedNames())
 	preparedValues := buildColumnsPreparedValues(tableColumns)
 
 	result = fmt.Sprintf(`
@@ -235,26 +221,26 @@ func BuildDMLInsertQuery(databaseName, tableName string, tableColumns, sharedCol
 	return result, sharedArgs, nil
 }
 
-func BuildDMLUpdateQuery(databaseName, tableName string, tableColumns, sharedColumns, mappedSharedColumns, uniqueKeyColumns *umconf.ColumnList, valueArgs, whereArgs []*interface{}) (result string, sharedArgs, columnArgs []interface{}, err error) {
+func BuildDMLUpdateQuery(databaseName, tableName string, tableColumns, sharedColumns, mappedSharedColumns, uniqueKeyColumns *umconf.ColumnList, valueArgs, whereArgs []*interface{}) (result string, sharedArgs, columnArgs []interface{}, hasUK bool, err error) {
 	if len(valueArgs) < tableColumns.Len() {
-		return result, sharedArgs, columnArgs, fmt.Errorf("value args count differs from table column count in BuildDMLUpdateQuery %v, %v",
+		return result, sharedArgs, columnArgs, hasUK, fmt.Errorf("value args count differs from table column count in BuildDMLUpdateQuery %v, %v",
 			len(valueArgs), tableColumns.Len())
 	}
 	if len(whereArgs) < tableColumns.Len() {
-		return result, sharedArgs, columnArgs, fmt.Errorf("where args count differs from table column count in BuildDMLUpdateQuery %v, %v",
+		return result, sharedArgs, columnArgs, hasUK, fmt.Errorf("where args count differs from table column count in BuildDMLUpdateQuery %v, %v",
 			len(whereArgs), tableColumns.Len())
 	}
 	if !sharedColumns.IsSubsetOf(tableColumns) {
-		return result, sharedArgs, columnArgs, fmt.Errorf("shared columns is not a subset of table columns in BuildDMLUpdateQuery")
+		return result, sharedArgs, columnArgs, hasUK, fmt.Errorf("shared columns is not a subset of table columns in BuildDMLUpdateQuery")
 	}
 	if sharedColumns.Len() == 0 {
-		return result, sharedArgs, columnArgs, fmt.Errorf("No shared columns found in BuildDMLUpdateQuery")
+		return result, sharedArgs, columnArgs, hasUK, fmt.Errorf("No shared columns found in BuildDMLUpdateQuery")
 	}
-	databaseName = EscapeName(databaseName)
-	tableName = EscapeName(tableName)
+	databaseName = umconf.EscapeName(databaseName)
+	tableName = umconf.EscapeName(tableName)
 
 	for _, column := range tableColumns.ColumnList() {
-		tableOrdinal := tableColumns.Ordinals[column.Name]
+		tableOrdinal := tableColumns.Ordinals[column.RawName]
 		if *valueArgs[tableOrdinal] == nil || *valueArgs[tableOrdinal] == "NULL" ||
 			fmt.Sprintf("%v", *valueArgs[tableOrdinal]) == "" {
 			sharedArgs = append(sharedArgs, *valueArgs[tableOrdinal])
@@ -268,19 +254,19 @@ func BuildDMLUpdateQuery(databaseName, tableName string, tableColumns, sharedCol
 	uniqueKeyComparisons := []string{}
 	uniqueKeyArgs := make([]interface{}, 0)
 	for _, column := range tableColumns.ColumnList() {
-		tableOrdinal := tableColumns.Ordinals[column.Name]
+		tableOrdinal := tableColumns.Ordinals[column.RawName]
 		if *whereArgs[tableOrdinal] == nil {
-			comparison, err := BuildValueComparison(column.Name, "NULL", IsEqualsComparisonSign)
+			comparison, err := BuildValueComparison(column.EscapedName, "NULL", IsEqualsComparisonSign)
 			if err != nil {
-				return result, sharedArgs, columnArgs, err
+				return result, sharedArgs, columnArgs, hasUK, err
 			}
 			comparisons = append(comparisons, comparison)
 		} else {
-			if strings.HasPrefix(column.ColumnType, "binary") {
+			if column.Type == umconf.BinaryColumnType {
 				arg := column.ConvertArg(*whereArgs[tableOrdinal])
-				comparison, err := BuildValueComparison(column.Name, fmt.Sprintf("cast('%v' as %s)", arg, column.ColumnType), EqualsComparisonSign)
+				comparison, err := BuildValueComparison(column.EscapedName, fmt.Sprintf("cast('%v' as %s)", arg, column.ColumnType), EqualsComparisonSign)
 				if err != nil {
-					return result, sharedArgs, columnArgs, err
+					return result, sharedArgs, columnArgs, hasUK, err
 				}
 				if strings.ToUpper(column.Key) == "PRI" {
 					uniqueKeyComparisons = append(uniqueKeyComparisons, comparison)
@@ -289,9 +275,9 @@ func BuildDMLUpdateQuery(databaseName, tableName string, tableColumns, sharedCol
 				}
 			} else {
 				arg := column.ConvertArg(*whereArgs[tableOrdinal])
-				comparison, err := BuildValueComparison(column.Name, "?", EqualsComparisonSign)
+				comparison, err := BuildValueComparison(column.EscapedName, "?", EqualsComparisonSign)
 				if err != nil {
-					return result, sharedArgs, columnArgs, err
+					return result, sharedArgs, columnArgs, hasUK, err
 				}
 				if strings.ToUpper(column.Key) == "PRI" {
 					uniqueKeyArgs = append(uniqueKeyArgs, arg)
@@ -304,11 +290,11 @@ func BuildDMLUpdateQuery(databaseName, tableName string, tableColumns, sharedCol
 		}
 	}
 	if len(uniqueKeyComparisons) > 0 {
+		hasUK = true
 		comparisons = uniqueKeyComparisons
-	}
-	if len(uniqueKeyArgs) > 0 {
 		columnArgs = uniqueKeyArgs
 	}
+
 	setClause, err := BuildSetPreparedClause(mappedSharedColumns)
 
 	result = fmt.Sprintf(`
@@ -323,5 +309,5 @@ func BuildDMLUpdateQuery(databaseName, tableName string, tableColumns, sharedCol
 		setClause,
 		fmt.Sprintf("(%s)", strings.Join(comparisons, " and ")),
 	)
-	return result, sharedArgs, columnArgs, nil
+	return result, sharedArgs, columnArgs, hasUK, nil
 }

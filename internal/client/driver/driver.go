@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/actiontech/dtle/internal/client/driver/common"
+	"github.com/sirupsen/logrus"
+
 	uconf "github.com/actiontech/dtle/internal/config"
-	log "github.com/actiontech/dtle/internal/logger"
 	"github.com/actiontech/dtle/internal/models"
 )
 
@@ -50,7 +52,7 @@ type Factory func(*DriverContext) Driver
 // to support many pluggable implementations of task drivers.
 type Driver interface {
 	// Start is used to being task execution
-	Start(ctx *ExecContext, task *models.Task) (DriverHandle, error)
+	Start(ctx *common.ExecContext, task *models.Task) (DriverHandle, error)
 
 	// Drivers must validate their configuration
 	Validate(task *models.Task) (*models.TaskValidateResponse, error)
@@ -63,7 +65,7 @@ type DriverContext struct {
 	taskName string
 	allocID  string
 	config   *uconf.ClientConfig
-	logger   *log.Logger
+	logger   *logrus.Logger
 	node     *models.Node
 }
 
@@ -78,7 +80,7 @@ func NewEmptyDriverContext() *DriverContext {
 // private to the driver. If we want to change this later we can gorename all of
 // the fields in DriverContext.
 func NewDriverContext(taskName, allocID string, config *uconf.ClientConfig, node *models.Node,
-	logger *log.Logger) *DriverContext {
+	logger *logrus.Logger) *DriverContext {
 	return &DriverContext{
 		taskName: taskName,
 		allocID:  allocID,
@@ -102,19 +104,4 @@ type DriverHandle interface {
 
 	// Stats returns aggregated stats of the driver
 	Stats() (*models.TaskStatistics, error)
-}
-
-type ExecContext struct {
-	Subject    string
-	Tp         string
-	MaxPayload int
-}
-
-// NewExecContext is used to create a new execution context
-func NewExecContext(subject, tp string, mp int) *ExecContext {
-	return &ExecContext{
-		Subject:    subject,
-		Tp:         tp,
-		MaxPayload: mp,
-	}
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/actiontech/dtle/api"
 	"github.com/actiontech/dtle/internal/models"
+	"github.com/sirupsen/logrus"
 )
 
 func (s *HTTPServer) LoginRequest(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
@@ -148,6 +149,32 @@ func (s *HTTPServer) login(resp http.ResponseWriter, req *http.Request) (interfa
 	return out, nil
 }
 
+func (s *HTTPServer) setLogLevel(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if req.Method != "GET" {
+		resp.WriteHeader(http.StatusMethodNotAllowed)
+		return nil, nil
+	}
+
+	path := strings.TrimPrefix(req.URL.Path, "/v1/orders/level")
+
+	switch {
+	case strings.HasSuffix(path, "/info"):
+		s.logger.SetLevel(logrus.InfoLevel)
+		return "success", nil
+	case strings.HasSuffix(path, "/debug"):
+		s.logger.SetLevel(logrus.DebugLevel)
+		return "success", nil
+	case strings.HasSuffix(path, "/err"):
+		s.logger.SetLevel(logrus.ErrorLevel)
+		return "success", nil
+	case strings.HasSuffix(path, "/warn"):
+		s.logger.SetLevel(logrus.WarnLevel)
+		return "success", nil
+	default:
+		return "fail", nil
+	}
+}
+
 func (s *HTTPServer) orderQuery(resp http.ResponseWriter, req *http.Request,
 	orderID string) (interface{}, error) {
 	if req.Method != "GET" {
@@ -192,7 +219,9 @@ func (s *HTTPServer) orderCloudRegister(resp http.ResponseWriter, req *http.Requ
 	sPara := filterParams(m_sign)
 	//获得签名结果
 	mySign := createSign(sPara, "11111")
-	s.logger.Printf("mySign:%v", mySign)
+	s.logger.WithFields(logrus.Fields{
+		"mySign": mySign,
+	}).Printf("mySign")
 	if mySign != queryValues.Get("token") {
 		return nil, CodedError(400, "Invalid security token")
 	}

@@ -39,8 +39,16 @@ type Config struct {
 	// DataDir is the directory to store our store in
 	DataDir string `mapstructure:"data_dir"`
 
+	// PprofSwitch is the witch to open pprof
+	PprofSwitch bool `mapstructure:"pprof_switch"`
+
+	// PprofTime is the cpu  to open pprof
+	PprofTime int64 `mapstructure:"pprof_time"`
+
 	// LogLevel is the level of the logs to putout
-	LogLevel string `mapstructure:"log_level"`
+	LogLevel      string `mapstructure:"log_level"`
+	LogMaxSize    int    `mapstructure:"log_max_size"`
+	LogMaxBackups int    `mapstructure:"log_max_backups"`
 
 	LogToStdout bool `mapstructure:"log_to_stdout"`
 
@@ -122,6 +130,17 @@ type Config struct {
 	// Schema name for dtle meta info (e.g. gtid_executed).
 	// Do not use special characters (which need to be quoted) in schema name.
 	DtleSchemaName string `mapstructure:"dtle_schema_name"`
+
+	// CoverageReportPort is the HTTP port of code coverage report, 0 is disable
+	CoverageReportPort int `mapstructure:"coverage_report_port"`
+
+	// CoverageReportRawCodeDir is the root deploy directory of coverage report raw code
+	CoverageReportRawCodeDir string `mapstructure:"coverage_report_raw_code_dir"`
+
+	//jaegerAgentAddress is jaeger tracing Data reporting address
+	JaegerAgentAddress string `mapstructure:"jaeger_agent_address"`
+	//jaegerAgentPort is jaeger tracing Data reporting port
+	JaegerAgentPort string `mapstructure:"jaeger_agent_port"`
 }
 
 // ClientConfig is configuration specific to the client mode
@@ -240,13 +259,19 @@ type Node struct {
 // DefaultConfig is a the baseline configuration for Udup
 func DefaultConfig() *Config {
 	return &Config{
-		LogLevel:    "INFO",
-		LogFile:     "/var/log/dtle/dtle.log",
-		LogToStdout: false,
-		PidFile:     "/var/run/dtle/dtle.pid",
-		Region:      "global",
-		Datacenter:  "dc1",
-		BindAddr:    "0.0.0.0",
+		LogLevel:           "INFO",
+		LogFile:            "/var/log/dtle/dtle.log",
+		LogMaxSize:         1024,
+		LogMaxBackups:      100,
+		LogToStdout:        false,
+		PprofSwitch:        false,
+		PprofTime:          0,
+		PidFile:            "/var/run/dtle/dtle.pid",
+		Region:             "global",
+		Datacenter:         "dc1",
+		BindAddr:           "0.0.0.0",
+		JaegerAgentAddress: "",
+		JaegerAgentPort:    "",
 		Ports: &Ports{
 			HTTP: 8190,
 			RPC:  8191,
@@ -335,6 +360,12 @@ func (c *Config) Merge(b *Config) *Config {
 	if b.LogLevel != "" {
 		result.LogLevel = b.LogLevel
 	}
+	if b.LogMaxSize != 0 {
+		result.LogMaxSize = b.LogMaxSize
+	}
+	if b.LogMaxBackups != 0 {
+		result.LogMaxBackups = b.LogMaxBackups
+	}
 	if b.LogFile != "" {
 		result.LogFile = b.LogFile
 	}
@@ -343,6 +374,12 @@ func (c *Config) Merge(b *Config) *Config {
 	}
 	if b.PidFile != "" {
 		result.PidFile = b.PidFile
+	}
+	if b.PprofSwitch != false {
+		result.PprofSwitch = b.PprofSwitch
+	}
+	if b.PprofTime != 0 {
+		result.PprofTime = b.PprofTime
 	}
 	if b.BindAddr != "" {
 		result.BindAddr = b.BindAddr
@@ -355,6 +392,12 @@ func (c *Config) Merge(b *Config) *Config {
 	}
 	if b.LeaveOnTerm {
 		result.LeaveOnTerm = true
+	}
+	if b.JaegerAgentAddress != "" {
+		result.JaegerAgentAddress = b.JaegerAgentAddress
+	}
+	if b.JaegerAgentPort != "" {
+		result.JaegerAgentPort = b.JaegerAgentPort
 	}
 
 	// Apply the metric config

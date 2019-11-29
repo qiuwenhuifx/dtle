@@ -25,7 +25,7 @@ var (
 			Subsystem: "statistics",
 			Name:      "auto_analyze_duration_seconds",
 			Help:      "Bucketed histogram of processing time (s) of auto analyze.",
-			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 20),
+			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 20), // 10ms ~ 3hours
 		})
 
 	AutoAnalyzeCounter = prometheus.NewCounterVec(
@@ -68,13 +68,20 @@ var (
 			Name:      "update_stats_total",
 			Help:      "Counter of updating stats using feedback.",
 		}, []string{LblType})
-)
 
-func init() {
-	prometheus.MustRegister(AutoAnalyzeHistogram)
-	prometheus.MustRegister(AutoAnalyzeCounter)
-	prometheus.MustRegister(StatsInaccuracyRate)
-	prometheus.MustRegister(PseudoEstimation)
-	prometheus.MustRegister(DumpFeedbackCounter)
-	prometheus.MustRegister(UpdateStatsCounter)
-}
+	StoreQueryFeedbackCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "statistics",
+			Name:      "store_query_feedback_total",
+			Help:      "Counter of storing query feedback.",
+		}, []string{LblType})
+
+	SignificantFeedbackCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "statistics",
+			Name:      "high_error_rate_feedback_total",
+			Help:      "Counter of query feedback whose actual count is much different than calculated by current statistics",
+		})
+)

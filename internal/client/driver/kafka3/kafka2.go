@@ -16,8 +16,9 @@ import (
 
 	"strconv"
 
-	"github.com/Shopify/sarama"
 	"time"
+
+	"github.com/Shopify/sarama"
 )
 
 type SchemaType string
@@ -34,6 +35,7 @@ const (
 	SCHEMA_TYPE_INT8    = "int8"
 	SCHEMA_TYPE_BYTES   = "bytes"
 	SCHEMA_TYPE_FLOAT64 = "float64"
+	SCHEMA_TYPE_DOUBLE  = "float64"
 	SCHEMA_TYPE_FLOAT32 = "float32"
 	SCHEMA_TYPE_BOOLEAN = "boolean"
 
@@ -101,7 +103,8 @@ var (
 			NewSimpleSchemaField(SCHEMA_TYPE_STRING, false, "file"),
 			NewSimpleSchemaField(SCHEMA_TYPE_INT64, false, "pos"),
 			NewSimpleSchemaField(SCHEMA_TYPE_INT32, false, "row"),
-			NewSimpleSchemaField(SCHEMA_TYPE_BOOLEAN, true, "snapshot"),
+			NewSimpleSchemaField(SCHEMA_TYPE_STRING, true, "query"),
+			NewSimpleSchemaWithDefaultField(SCHEMA_TYPE_BOOLEAN, true, "snapshot", false),
 			NewSimpleSchemaField(SCHEMA_TYPE_INT64, true, "thread"),
 			NewSimpleSchemaField(SCHEMA_TYPE_STRING, true, "db"),
 			NewSimpleSchemaField(SCHEMA_TYPE_STRING, true, "table"),
@@ -184,6 +187,7 @@ type SourcePayload struct {
 	Gtid     interface{} `json:"gtid"` // real type: optional<string>
 	File     string      `json:"file"`
 	Pos      int64       `json:"pos"`
+	Query    interface{} `json:"query"`
 	Row      int         `json:"row"`
 	Snapshot bool        `json:"snapshot"`
 	Thread   interface{} `json:"thread"` // real type: optional<int64>
@@ -194,6 +198,7 @@ type SourcePayload struct {
 type Schema struct {
 	Type       SchemaType             `json:"type"`
 	Optional   bool                   `json:"optional"`
+	Default    interface{}            `json:"default,omitempty"`
 	Field      string                 `json:"field,omitempty"` // field name in outer struct
 	Fields     []*Schema              `json:"fields,omitempty"`
 	Name       string                 `json:"name,omitempty"`
@@ -245,9 +250,39 @@ func NewSimpleSchemaField(theType SchemaType, optional bool, field string) *Sche
 		Field:    field,
 	}
 }
-func NewDecimalField(precision int, scale int, optional bool, field string) *Schema {
+func NewSimpleSchemaWithDefaultField(theType SchemaType, optional bool, field string, defaultValue interface{}) *Schema {
+	if defaultValue != nil {
+		switch theType {
+		case SCHEMA_TYPE_BYTES:
+			defaultValue = base64.StdEncoding.EncodeToString([]byte(defaultValue.(string)))
+		case SCHEMA_TYPE_INT16:
+			val16, _ := strconv.ParseInt(defaultValue.(string), 10, 16)
+			defaultValue = val16
+		case SCHEMA_TYPE_INT32:
+			val32, _ := strconv.ParseInt(defaultValue.(string), 10, 32)
+			defaultValue = val32
+		case SCHEMA_TYPE_INT64:
+			val64, _ := strconv.ParseInt(defaultValue.(string), 10, 64)
+			defaultValue = val64
+		case SCHEMA_TYPE_FLOAT64:
+			floatValue, _ := strconv.ParseFloat(defaultValue.(string), 64)
+			defaultValue = floatValue
+		}
+	}
+	return &Schema{
+		Default:  defaultValue,
+		Type:     theType,
+		Optional: optional,
+		Field:    field,
+	}
+}
+func NewDecimalField(precision int, scale int, optional bool, field string, defaultValue interface{}) *Schema {
+	if defaultValue != nil {
+		defaultValue = DecimalValueFromStringMysql(defaultValue.(string))
+	}
 	return &Schema{
 		Field:    field,
+		Default:  defaultValue,
 		Optional: optional,
 		Name:     "org.apache.kafka.connect.data.Decimal",
 		Parameters: map[string]interface{}{
@@ -314,8 +349,12 @@ func DecimalValueFromStringMysql(value string) string {
 	return base64.StdEncoding.EncodeToString(bs)
 }
 
-func NewTimeField(optional bool, field string) *Schema {
+func NewTimeField(optional bool, field string, defaultValue interface{}) *Schema {
+	if defaultValue != nil {
+		defaultValue = TimeValue(defaultValue.(string))
+	}
 	return &Schema{
+		Default:  defaultValue,
 		Field:    field,
 		Optional: optional,
 		Type:     SCHEMA_TYPE_INT64,
@@ -383,18 +422,25 @@ func TimeValue(value string) int64 {
 
 	return timeValueHelper(h, m, s, microsec, isNeg)
 }
-func NewDateTimeField(optional bool, field string) *Schema {
+func NewDateTimeField(optional bool, field string, defaultValue interface{}) *Schema {
+	if defaultValue != nil {
+		defaultValue = DateTimeValue(defaultValue.(string))
+	}
 	return &Schema{
+		Default:  defaultValue,
 		Field:    field,
 		Optional: optional,
 		Type:     SCHEMA_TYPE_INT64,
-		Name:     "io.debezium.time.MicroTimestamp",
+		Name:     "io.debezium.time.Timestamp",
 		Version:  1,
 	}
 }
 func DateTimeValue(dateTime string) int64 {
-	tm2, _ := time.Parse("2006-01-02 15:04:05", dateTime)
-	return tm2.Unix()
+	tm2, error := time.Parse("2006-01-02 15:04:05", dateTime)
+	if error != nil {
+		return 0
+	}
+	return tm2.UnixNano() / 1e6
 }
 func DateValue(date string) int64 {
 	tm2, error := time.Parse("2006-01-02 15:04:05", date+" 00:00:00")
@@ -410,4 +456,129 @@ func NewJsonField(optional bool, field string) *Schema {
 		Type:     SCHEMA_TYPE_STRING,
 		Name:     "io.debezium.data.Json",
 	}
+}
+
+func NewBitsField(optional bool, field string, length string, defaultValue interface{}) *Schema {
+	if defaultValue != nil {
+		defaultValue = strings.Replace(defaultValue.(string)[1:], "'", "", -1)
+
+		defaultValue = base64.StdEncoding.EncodeToString(BinaryStringToBytes(defaultValue.(string)))
+	}
+	return &Schema{
+		Field:    field,
+		Optional: optional,
+		Default:  defaultValue,
+		Parameters: map[string]interface{}{
+			"length": length,
+		},
+		Type:    SCHEMA_TYPE_BYTES,
+		Name:    "io.debezium.data.Bits",
+		Version: 1,
+	}
+}
+func NewDateField(theType SchemaType, optional bool, field string, defaultValue interface{}) *Schema {
+	if defaultValue != nil {
+		defaultValue = DateValue(defaultValue.(string))
+	}
+	return &Schema{
+		Field:    field,
+		Default:  defaultValue,
+		Optional: optional,
+		Type:     theType,
+		Name:     "io.debezium.time.Date",
+		Version:  1,
+	}
+}
+func NewEnumField(theType SchemaType, optional bool, field string, allowed string, defaultValue interface{}) *Schema {
+	allowed = strings.Replace(allowed[5:len(allowed)-1], "'", "", -1)
+	return &Schema{
+		Default:  defaultValue,
+		Field:    field,
+		Optional: optional,
+		Parameters: map[string]interface{}{
+			"allowed": allowed,
+		},
+		Type:    theType,
+		Name:    "io.debezium.data.Enum",
+		Version: 1,
+	}
+}
+func NewSetField(theType SchemaType, optional bool, field string, allowed string, defaultValue interface{}) *Schema {
+	allowed = strings.Replace(allowed[4:len(allowed)-1], "'", "", -1)
+	return &Schema{
+		Field:    field,
+		Optional: optional,
+		Default:  defaultValue,
+		Parameters: map[string]interface{}{
+			"allowed": allowed,
+		},
+		Type:    theType,
+		Name:    "io.debezium.data.EnumSet",
+		Version: 1,
+	}
+}
+func NewTimeStampField(theType SchemaType, optional bool, field string, defaultValue interface{}) *Schema {
+	if defaultValue == "CURRENT_TIMESTAMP" {
+		defaultValue = "1970-01-01T00:00:00Z"
+	} else if defaultValue != nil {
+		defaultValue = defaultValue.(string)[:10] + "T" + defaultValue.(string)[11:] + "Z"
+	}
+	return &Schema{
+		Field:    field,
+		Optional: optional,
+		Default:  defaultValue,
+		Type:     theType,
+		Name:     "io.debezium.time.ZonedTimestamp",
+		Version:  1,
+	}
+}
+func NewYearField(theType SchemaType, optional bool, field string, defaultValue interface{}) *Schema {
+	return &Schema{
+		Field:    field,
+		Default:  defaultValue,
+		Optional: optional,
+		Type:     theType,
+		Name:     "io.debezium.time.Year",
+		Version:  1,
+	}
+}
+
+func YearValue(year string) int {
+	int, err := strconv.Atoi(year)
+	if err != nil {
+		return 0
+	}
+	yearValue := int - 1900
+	if 0 < yearValue && yearValue <= 69 {
+		yearValue += 2000
+	} else if 70 <= yearValue && yearValue <= 99 {
+		yearValue += 1900
+	}
+	return yearValue
+
+}
+
+func BinaryStringToBytes(s string) (bs []byte) {
+	uint8arr := [8]uint8{128, 64, 32, 16, 8, 4, 2, 1}
+	l := len(s)
+	mo := l % 8
+	l /= 8
+	if mo != 0 {
+		l++
+	}
+	bs = make([]byte, 0, l)
+	mo = 8 - mo
+	var n uint8
+	for i, b := range []byte(s) {
+		m := (i + mo) % 8
+		switch b {
+		case byte('1'):
+			n += uint8arr[m]
+		}
+		if m == 7 {
+			bs = append(bs, n)
+			n = 0
+		}
+	}
+	return bs
 }

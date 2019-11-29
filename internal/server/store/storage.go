@@ -9,10 +9,10 @@ package store
 import (
 	"fmt"
 	"io"
-	"log"
 	"strconv"
 
 	"github.com/hashicorp/go-memdb"
+	"github.com/sirupsen/logrus"
 
 	"github.com/actiontech/dtle/internal/models"
 )
@@ -32,7 +32,7 @@ type IndexEntry struct {
 // returned as a result of a read against the state store should be
 // considered a constant and NEVER modified in place.
 type StateStore struct {
-	logger *log.Logger
+	logger *logrus.Logger
 	db     *memdb.MemDB
 
 	// abandonCh is used to signal watchers that this state store has been
@@ -50,7 +50,7 @@ func NewStateStore(logOutput io.Writer) (*StateStore, error) {
 
 	// Create the state store
 	s := &StateStore{
-		logger:    log.New(logOutput, "", log.LstdFlags|log.Lmicroseconds),
+		logger:    logrus.New(),
 		db:        db,
 		abandonCh: make(chan struct{}),
 	}
@@ -1025,11 +1025,6 @@ func (s *StateStore) nestedUpdateAllocFromClient(txn *memdb.Txn, index uint64, a
 	// Update the modify index
 	copyAlloc.ModifyIndex = index
 
-	// Update the allocation
-	if err := txn.Insert("allocs", copyAlloc); err != nil {
-		return fmt.Errorf("alloc insert failed: %v", err)
-	}
-
 	// Set the job's status
 	forceStatus := ""
 	if !copyAlloc.ClientTerminalStatus() {
@@ -1041,6 +1036,23 @@ func (s *StateStore) nestedUpdateAllocFromClient(txn *memdb.Txn, index uint64, a
 		}
 	} else {
 		forceStatus = models.JobStatusDead
+	}
+	if forceStatus == models.JobStatusDead && copyAlloc.DesiredDescription == "" {
+		for _, v := range alloc.TaskStates {
+			if copyAlloc.DesiredDescription != "" {
+				break
+			}
+			for _, event := range v.Events {
+				if event.Message != "" {
+					copyAlloc.DesiredDescription = event.Message
+					break
+				}
+			}
+		}
+	}
+	// Update the allocation
+	if err := txn.Insert("allocs", copyAlloc); err != nil {
+		return fmt.Errorf("alloc insert failed: %v", err)
 	}
 	jobs := map[string]string{exist.JobID: forceStatus}
 	if err := s.setJobStatuses(index, txn, jobs, false); err != nil {
@@ -1142,6 +1154,7 @@ func (s *StateStore) UpsertAlloc(index uint64, alloc *models.Allocation) error {
 
 		// The job has been denormalized so re-attach the original job
 		if alloc.Job == nil {
+			exist.Job.StatusDescription = alloc.DesiredDescription
 			alloc.Job = exist.Job
 		}
 	}
@@ -1448,6 +1461,10 @@ func (s *StateStore) setJobStatus(index uint64, txn *memdb.Txn,
 			return err
 		}
 	}
+	allocs, err := txn.Get("allocs", "job", job.ID)
+	if err != nil {
+		return err
+	}
 
 	// Fast-path if nothing has changed.
 	if oldStatus == newStatus {
@@ -1458,6 +1475,12 @@ func (s *StateStore) setJobStatus(index uint64, txn *memdb.Txn,
 	updated := job.Copy()
 	updated.Status = newStatus
 	updated.ModifyIndex = index
+	for alloc := allocs.Next(); alloc != nil; alloc = allocs.Next() {
+		if alloc.(*models.Allocation).DesiredDescription != "" {
+			updated.StatusDescription = alloc.(*models.Allocation).DesiredDescription
+			break
+		}
+	}
 
 	// Insert the job
 	if err := txn.Insert("jobs", updated); err != nil {

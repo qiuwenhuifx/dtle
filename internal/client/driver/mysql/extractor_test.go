@@ -203,7 +203,7 @@ func TestExtractor_validateConnection(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.e.validateConnection(); (err != nil) != tt.wantErr {
+			if err := tt.e.validateConnectionAndGetVersion(); (err != nil) != tt.wantErr {
 				t.Errorf("Extractor.validateConnection() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
@@ -237,8 +237,8 @@ func TestExtractor_readCurrentBinlogCoordinates(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.e.readCurrentBinlogCoordinates(); (err != nil) != tt.wantErr {
-				t.Errorf("Extractor.readCurrentBinlogCoordinates() error = %v, wantErr %v", err, tt.wantErr)
+			if err := tt.e.setInitialBinlogCoordinates(); (err != nil) != tt.wantErr {
+				t.Errorf("Extractor.setInitialBinlogCoordinates() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

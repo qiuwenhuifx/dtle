@@ -7,32 +7,34 @@
 package mysql
 
 import (
-	"bytes"
 	"fmt"
-	"github.com/actiontech/dtle/internal/g"
 	"os"
 	"strings"
 	"sync"
 
-	ubase "github.com/actiontech/dtle/internal/client/driver/mysql/base"
+	"github.com/actiontech/dtle/internal/g"
+
+	"time"
+
 	usql "github.com/actiontech/dtle/internal/client/driver/mysql/sql"
 	"github.com/actiontech/dtle/internal/config"
 	umconf "github.com/actiontech/dtle/internal/config/mysql"
-	log "github.com/actiontech/dtle/internal/logger"
-	"time"
+	"github.com/sirupsen/logrus"
 )
 
 type dumper struct {
-	logger         *log.Entry
-	chunkSize      int64
-	TableSchema    string
-	TableName      string
-	table          *config.Table
-	columns        string
-	resultsChannel chan *DumpEntry
-	shutdown       bool
-	shutdownCh     chan struct{}
-	shutdownLock   sync.Mutex
+	logger             *logrus.Entry
+	chunkSize          int64
+	TableSchema        string
+	EscapedTableSchema string
+	TableName          string
+	EscapedTableName   string
+	table              *config.Table
+	columns            string
+	resultsChannel     chan *DumpEntry
+	shutdown           bool
+	shutdownCh         chan struct{}
+	shutdownLock       sync.Mutex
 
 	// DB is safe for using in goroutines
 	// http://golang.org/src/database/sql/sql.go?s=5574:6362#L201
@@ -41,20 +43,25 @@ type dumper struct {
 	// 0: don't checksum; 1: checksum once; 2: checksum every time
 	doChecksum int
 	oldWayDump bool
+
+	sentTableDef bool
 }
 
 func NewDumper(db usql.QueryAble, table *config.Table, chunkSize int64,
-	logger *log.Entry) *dumper {
+	logger *logrus.Entry) *dumper {
 
 	dumper := &dumper{
-		logger:         logger,
-		db:             db,
-		TableSchema:    table.TableSchema,
-		TableName:      table.TableName,
-		table:          table,
-		resultsChannel: make(chan *DumpEntry, 24),
-		chunkSize:      chunkSize,
-		shutdownCh:     make(chan struct{}),
+		logger:             logger,
+		db:                 db,
+		TableSchema:        table.TableSchema,
+		EscapedTableSchema: umconf.EscapeName(table.TableSchema),
+		TableName:          table.TableName,
+		EscapedTableName:   umconf.EscapeName(table.TableName),
+		table:              table,
+		resultsChannel:     make(chan *DumpEntry, 24),
+		chunkSize:          chunkSize,
+		shutdownCh:         make(chan struct{}),
+		sentTableDef:       false,
 	}
 	switch os.Getenv(g.ENV_DUMP_CHECKSUM) {
 	case "1":
@@ -74,9 +81,11 @@ func NewDumper(db usql.QueryAble, table *config.Table, chunkSize int64,
 type dumpStatResult struct {
 	Gtid       string
 	TotalCount int64
+	LogFile    string
+	LogPos     int64
 }
 
-type DumpEntry struct {
+type DumpEntryOrig struct {
 	SystemVariablesStatement string
 	SqlMode                  string
 	DbSQL                    string
@@ -86,39 +95,29 @@ type DumpEntry struct {
 	// For each `*interface{}` item, it is ensured to be not nil.
 	// If field is sql-NULL, *item is nil. Else, *item is a `[]byte`.
 	// TODO can we just use interface{}? Make sure it is not copied again and again.
-	ValuesX                  [][]*interface{}
-	TotalCount               int64
-	RowsCount                int64
-	colBuffer                bytes.Buffer
-	err                      error
-	Table                    *config.Table
+	ValuesX    [][]*interface{}
+	TotalCount int64
+	RowsCount  int64
+	Err        error
+	Table      *config.Table
 }
 
 func (e *DumpEntry) incrementCounter() {
 	e.RowsCount++
 }
 
-func (d *dumper) prepareForDumping() (error) {
-	columnList, err := ubase.GetTableColumns(d.db, d.TableSchema, d.TableName)
-	if err != nil {
-		return err
-	}
-
-	if err := ubase.ApplyColumnTypes(d.db, d.TableSchema, d.TableName, columnList); err != nil {
-		return err
-	}
-
+func (d *dumper) prepareForDumping() error {
 	needPm := false
 	columns := make([]string, 0)
-	for _, col := range columnList.Columns {
+	for _, col := range d.table.OriginalTableColumns.Columns {
 		switch col.Type {
 		case umconf.FloatColumnType, umconf.DoubleColumnType,
 			umconf.MediumIntColumnType, umconf.BigIntColumnType,
 			umconf.DecimalColumnType:
-			columns = append(columns, fmt.Sprintf("`%s`+0", col.Name))
+			columns = append(columns, fmt.Sprintf("%s+0", col.EscapedName))
 			needPm = true
 		default:
-			columns = append(columns, fmt.Sprintf("`%s`", col.Name))
+			columns = append(columns, col.EscapedName)
 		}
 	}
 	if needPm {
@@ -133,11 +132,11 @@ func (d *dumper) prepareForDumping() (error) {
 func (d *dumper) buildQueryOldWay() string {
 	return fmt.Sprintf(`SELECT %s FROM %s.%s where (%s) LIMIT %d OFFSET %d`,
 		d.columns,
-		usql.EscapeName(d.TableSchema),
-		usql.EscapeName(d.TableName),
+		d.EscapedTableSchema,
+		d.EscapedTableName,
 		d.table.Where,
 		d.chunkSize,
-		d.table.Iteration * d.chunkSize,
+		d.table.Iteration*d.chunkSize,
 	)
 }
 
@@ -145,7 +144,7 @@ func (d *dumper) buildQueryOnUniqueKey() string {
 	nCol := len(d.table.UseUniqueKey.Columns.Columns)
 	uniqueKeyColumnAscending := make([]string, nCol, nCol)
 	for i, col := range d.table.UseUniqueKey.Columns.Columns {
-		colName := usql.EscapeName(col.Name)
+		colName := col.EscapedName
 		switch col.Type {
 		case umconf.EnumColumnType:
 			// TODO try mysql enum type
@@ -167,11 +166,11 @@ func (d *dumper) buildQueryOnUniqueKey() string {
 			innerItems := make([]string, x+1)
 
 			for y := 0; y < x; y++ {
-				colName := usql.EscapeName(d.table.UseUniqueKey.Columns.Columns[y].Name)
+				colName := d.table.UseUniqueKey.Columns.Columns[y].EscapedName
 				innerItems[y] = fmt.Sprintf("(%s = %s)", colName, d.table.UseUniqueKey.LastMaxVals[y])
 			}
 
-			colName := usql.EscapeName(d.table.UseUniqueKey.Columns.Columns[x].Name)
+			colName := d.table.UseUniqueKey.Columns.Columns[x].EscapedName
 			innerItems[x] = fmt.Sprintf("(%s > %s)", colName, d.table.UseUniqueKey.LastMaxVals[x])
 
 			rangeItems[x] = fmt.Sprintf("(%s)", strings.Join(innerItems, " and "))
@@ -182,8 +181,8 @@ func (d *dumper) buildQueryOnUniqueKey() string {
 
 	return fmt.Sprintf(`SELECT %s FROM %s.%s where (%s) and (%s) order by %s LIMIT %d`,
 		d.columns,
-		usql.EscapeName(d.TableSchema),
-		usql.EscapeName(d.TableName),
+		d.EscapedTableSchema,
+		d.EscapedTableName,
 		// where
 		rangeStr, d.table.Where,
 		// order by
@@ -200,10 +199,10 @@ func (d *dumper) getChunkData() (nRows int64, err error) {
 		TableName:   d.TableName,
 		RowsCount:   0,
 	}
-	// TODO use PS
-	// TODO escape schema/table/column name once and save
 	defer func() {
-		entry.err = err
+		if err != nil {
+			entry.Err = err.Error()
+		}
 		if err == nil && entry.RowsCount == 0 {
 			return
 		}
@@ -256,7 +255,10 @@ func (d *dumper) getChunkData() (nRows int64, err error) {
 	d.table.Iteration += 1
 	rows, err := d.db.Query(query)
 	if err != nil {
-		return 0, fmt.Errorf("exec [%s] error: %v", query, err)
+		d.logger.Debugf("mysql.dumper. error at select chunk. query: ", query)
+		newErr := fmt.Errorf("mysql.dumper. error at select chunk. err: %v", err)
+		d.logger.Errorf(newErr.Error())
+		return 0, err
 	}
 
 	columns, err := rows.Columns()
@@ -266,10 +268,8 @@ func (d *dumper) getChunkData() (nRows int64, err error) {
 
 	scanArgs := make([]interface{}, len(columns)) // tmp use, for casting `values` to `[]interface{}`
 
-	interfacePtrWithNil := new(interface{})
-
 	for rows.Next() {
-		rowValuesRaw := make([]*interface{}, len(columns))
+		rowValuesRaw := make([]*[]byte, len(columns))
 		for i := range rowValuesRaw {
 			scanArgs[i] = &rowValuesRaw[i]
 		}
@@ -279,11 +279,6 @@ func (d *dumper) getChunkData() (nRows int64, err error) {
 			return 0, err
 		}
 
-		for i := range rowValuesRaw {
-			if rowValuesRaw[i] == nil {
-				rowValuesRaw[i] = interfacePtrWithNil
-			}
-		}
 		entry.ValuesX = append(entry.ValuesX, rowValuesRaw)
 
 		entry.incrementCounter()
@@ -302,7 +297,7 @@ func (d *dumper) getChunkData() (nRows int64, err error) {
 			// lastVals must not be nil if len(data) > 0
 			for i, col := range d.table.UseUniqueKey.Columns.Columns {
 				// TODO save the idx
-				idx := d.table.OriginalTableColumns.Ordinals[col.Name]
+				idx := d.table.OriginalTableColumns.Ordinals[strings.ToLower(col.RawName)]
 				if idx > len(lastVals) {
 					return entry.RowsCount, fmt.Errorf("getChunkData. GetLastMaxVal: column index %v > n_column %v", idx, len(lastVals))
 				} else {
@@ -312,7 +307,12 @@ func (d *dumper) getChunkData() (nRows int64, err error) {
 			d.logger.Debugf("GetLastMaxVal: got %v", d.table.UseUniqueKey.LastMaxVals)
 		}
 	}
-
+	if d.table.TableRename != "" {
+		entry.TableName = d.table.TableRename
+	}
+	if d.table.TableSchemaRename != "" {
+		entry.TableSchema = d.table.TableSchemaRename
+	}
 	// ValuesX[i]: n-th row
 	// ValuesX[i][j]: j-th col of n-th row
 	// Values[i]: i-th chunk of rows

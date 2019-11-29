@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -27,11 +28,11 @@ import (
 	gnatsd "github.com/nats-io/gnatsd/server"
 	stand "github.com/nats-io/nats-streaming-server/server"
 	"github.com/shirou/gopsutil/host"
+	"github.com/sirupsen/logrus"
 
 	"github.com/actiontech/dtle/internal"
 	"github.com/actiontech/dtle/internal/client/driver"
 	"github.com/actiontech/dtle/internal/config"
-	ulog "github.com/actiontech/dtle/internal/logger"
 	"github.com/actiontech/dtle/internal/models"
 	"github.com/actiontech/dtle/internal/server"
 )
@@ -56,7 +57,7 @@ const (
 	getJobRetryIntv = 5 * time.Second
 
 	// stateSnapshotIntv is how often the client snapshots state
-	stateSnapshotIntv = 60 * time.Second
+	stateSnapshotIntv = 30 * time.Second
 
 	// initialHeartbeatStagger is used to stagger the interval between
 	// starting and the intial heartbeat. After the intial heartbeat,
@@ -95,7 +96,7 @@ type Client struct {
 	configCopy *config.ClientConfig
 	configLock sync.RWMutex
 
-	logger *ulog.Logger
+	logger *logrus.Logger
 
 	connPool *server.ConnPool
 
@@ -175,7 +176,7 @@ var (
 )
 
 // NewClient is used to create a new client from the given configuration
-func NewClient(cfg *config.ClientConfig, logger *ulog.Logger) (*Client, error) {
+func NewClient(cfg *config.ClientConfig, logger *logrus.Logger) (*Client, error) {
 	// Create the client
 	c := &Client{
 		config:              cfg,
@@ -838,7 +839,7 @@ func (c *Client) allocSync() {
 			aUpdates[alloc.ID] = alloc
 
 		case update := <-c.workUpdates:
-			jUpdates[update.JobID] = update
+			jUpdates[update.JobID + update.TaskType] = update
 
 		case <-syncTicker.C:
 			// Fast path if there are no updates
@@ -981,6 +982,7 @@ func (c *Client) watchAllocations(updates chan *allocUpdates, jUpdates chan *job
 		default:
 		}
 
+		c.logger.Debugf("*** rpc Node.GetClientAllocs returned. resp %v", resp)
 		// Filter all allocations whose AllocModifyIndex was not incremented.
 		// These are the allocations who have either not been updated, or whose
 		// updates are a result of the client sending an update for the alloc.
@@ -1369,6 +1371,16 @@ func (c *Client) removeAlloc(alloc *models.Allocation) error {
 
 	delete(c.allocs, alloc.ID)
 	c.allocLock.Unlock()
+
+	go func() {
+		time.Sleep(10 * time.Second) // wait alloc destroyed
+		err := os.RemoveAll(path.Join(c.config.StateDir, "binlog", alloc.JobID))
+		if os.IsNotExist(err) {
+			// do nothing
+		} else if err != nil {
+			c.logger.Errorf("error when deleting binlog file. job: %v, err: %v", alloc.JobID, err)
+		}
+	}()
 
 	return nil
 }

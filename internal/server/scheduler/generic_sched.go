@@ -12,11 +12,11 @@ import (
 
 	//"math/rand"
 
-	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-multierror"
 
-	log "github.com/actiontech/dtle/internal/logger"
 	"github.com/actiontech/dtle/internal/models"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -57,7 +57,7 @@ func (s *SetStatusError) Error() string {
 // to make a high quality placement. This is the primary scheduler for
 // most workloads.
 type GenericScheduler struct {
-	logger  *log.Logger
+	logger  *logrus.Logger
 	state   State
 	planner Planner
 
@@ -75,7 +75,7 @@ type GenericScheduler struct {
 }
 
 // NewGenericScheduler is a factory function to instantiate a new synchronous scheduler
-func NewGenericScheduler(logger *log.Logger, state State, planner Planner) Scheduler {
+func NewGenericScheduler(logger *logrus.Logger, state State, planner Planner) Scheduler {
 	s := &GenericScheduler{
 		logger:  logger,
 		state:   state,
@@ -327,6 +327,8 @@ func (s *GenericScheduler) computeJobAllocs() error {
 	}
 
 	for _, e := range diff.resume {
+		s.logger.WithField("taskConfig", e.Task.Config).WithField("alloc", e.Alloc).Debugf(
+			"*** computeJobAllocs. diff.resume")
 		s.plan.AppendUpdate(e.Alloc, models.AllocDesiredStatusRun, "", "")
 	}
 
@@ -424,7 +426,7 @@ func (s *GenericScheduler) computePlacements(place []allocTuple) error {
 
 			if missing.Task.Type == models.TaskTypeDest {
 				for i, task := range s.job.Tasks {
-					task.Config["NatsAddr"] = preferredNode.NatsAddr
+					task.Config["NatsAddr"] = preferredNode.NatsAdvertiseAddr
 					s.job.Tasks[i] = task
 				}
 			}

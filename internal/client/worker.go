@@ -17,12 +17,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/actiontech/dtle/internal/client/driver/common"
+
 	"github.com/armon/go-metrics"
 
 	"github.com/actiontech/dtle/internal/client/driver"
 	"github.com/actiontech/dtle/internal/config"
-	log "github.com/actiontech/dtle/internal/logger"
 	"github.com/actiontech/dtle/internal/models"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -43,7 +45,7 @@ const (
 type Worker struct {
 	config         *config.ClientConfig
 	updater        TaskStateUpdater
-	logger         *log.Logger
+	logger         *logrus.Logger
 	alloc          *models.Allocation
 	restartTracker *RestartTracker
 
@@ -101,7 +103,7 @@ type workerState struct {
 type TaskStateUpdater func(taskName, state string, event *models.TaskEvent)
 
 // NewWorker is used to create a new task context
-func NewWorker(logger *log.Logger, config *config.ClientConfig,
+func NewWorker(logger *logrus.Logger, config *config.ClientConfig,
 	updater TaskStateUpdater, alloc *models.Allocation,
 	task *models.Task, workUpdates chan *models.TaskUpdate) *Worker {
 
@@ -166,30 +168,46 @@ func (r *Worker) SaveState() error {
 		id := &config.DriverCtx{}
 		handleID := r.handle.ID()
 		if err := json.Unmarshal([]byte(handleID), id); err != nil {
-			r.logger.Errorf("agent: Failed to parse handle '%s': %v",
-				handleID, err)
+			r.logger.WithFields(logrus.Fields{
+				"handleId": handleID,
+				"err":      err,
+			}).Errorf("agent: Failed to parse handle")
 		}
-		if id.DriverConfig.Gtid != "" {
-			if r.task.Type == models.TaskTypeDest {
-				r.workUpdates <- &models.TaskUpdate{
-					JobID:    r.alloc.JobID,
-					Gtid:     id.DriverConfig.Gtid,
-					NatsAddr: id.DriverConfig.NatsAddr,
-				}
-			}
-		} else {
-			r.workUpdates <- &models.TaskUpdate{
+
+		{
+			tu := &models.TaskUpdate{
 				JobID:    r.alloc.JobID,
+				TaskType: r.task.Type,
 				NatsAddr: id.DriverConfig.NatsAddr,
 			}
+			if r.task.Type == models.TaskTypeDest {
+				if id.DriverConfig.Gtid != "" {
+					tu.Gtid = id.DriverConfig.Gtid
+				}
+				tu.BinlogFile = id.DriverConfig.BinlogFile
+				tu.BinlogPos = id.DriverConfig.BinlogPos
+			} else { // TaskTypeSrc
+				// nothing yet
+			}
+			r.workUpdates <- tu
 		}
-		r.logger.Debugf("Worker.SaveState: lock: %p, %p", r.task, r.task.ConfigLock)
+
+		r.logger.WithFields(logrus.Fields{
+			"task":       r.task,
+			"configLock": r.task.ConfigLock,
+		}).Debugf("Worker.SaveState: lock")
+
+		if id.DriverConfig.NatsAddr == "" {
+			r.logger.WithField("current_nats", r.task.Config["NatsAddr"]).Infof(
+				"DTLE_BUG_MAYBE. Worker.SaveState(): id.DriverConfig.NatsAddr is empty")
+		}
 		r.task.ConfigLock.Lock()
-		r.logger.Debugf("Worker.SaveState: after lock: %p", r.task)
 		r.task.Config["Gtid"] = id.DriverConfig.Gtid
 		r.task.Config["NatsAddr"] = id.DriverConfig.NatsAddr
 		r.task.ConfigLock.Unlock()
-		r.logger.Debugf("Worker.SaveState: after unlock: %p", r.task)
+		r.logger.WithFields(logrus.Fields{
+			"task": r.task,
+		}).Debugf("Worker.SaveState: after unlock")
 	}
 	r.handleLock.Unlock()
 	return nil
@@ -208,7 +226,10 @@ func (r *Worker) setState(state string, event *models.TaskEvent) {
 	// Persist our store to disk.
 	r.logger.Debugf("setState.SaveState")
 	if err := r.SaveState(); err != nil {
-		r.logger.Errorf("agent: Failed to save store of Task Runner for task %q: %v", r.task.Type, err)
+		r.logger.WithFields(logrus.Fields{
+			"taskType": r.task.Type,
+			"err":      err,
+		}).Errorf("agent: Failed to save store of Task Runner for task")
 	}
 
 	// Indicate the task has been updated.
@@ -230,8 +251,11 @@ func (r *Worker) createDriver() (driver.Driver, error) {
 // Run is a long running routine used to manage the task
 func (r *Worker) Run() {
 	defer close(r.waitCh)
-	r.logger.Debugf("agent: Starting task context for '%s' (alloc '%s')",
-		r.task.Type, r.alloc.ID)
+	r.logger.WithFields(logrus.Fields{
+		"taskType": r.task.Type,
+		"allocId":  r.alloc.ID,
+		"taskConfig": r.task.Config,
+	}).Debugf("agent: Starting task context from alloc")
 
 	// Create a driver so that we can determine the FSIsolation required
 	_, err := r.createDriver()
@@ -343,9 +367,16 @@ func (r *Worker) run() {
 				r.logger.Debugf("setState 4")
 				r.setState("", r.waitErrorToEvent(waitRes))
 				if !waitRes.Successful() {
-					r.logger.Errorf("agent: Task %q for alloc %q failed: %v", r.task.Type, r.alloc.ID, waitRes)
+					r.logger.WithFields(logrus.Fields{
+						"taskTuype": r.task.Type,
+						"allocId":   r.alloc.ID,
+						"waitRes":   waitRes,
+					}).Errorf("agent: Task %q for alloc %q failed: %v", r.task.Type, r.alloc.ID, waitRes)
 				} else {
-					r.logger.Printf("agent: Task %q for alloc %q completed successfully", r.task.Type, r.alloc.ID)
+					r.logger.WithFields(logrus.Fields{
+						"taskType": r.task.Type,
+						"allocId":  r.alloc.ID,
+					}).Printf("agent: Task %q for alloc %q completed successfully", r.task.Type, r.alloc.ID)
 				}
 
 				break WAIT
@@ -435,7 +466,10 @@ func (r *Worker) shouldRestart() bool {
 	reason := r.restartTracker.GetReason()
 	switch state {
 	case models.TaskNotRestarting, models.TaskTerminated:
-		r.logger.Printf("agent: Not restarting task: %v for alloc: %v ", r.task.Type, r.alloc.ID)
+		r.logger.WithFields(logrus.Fields{
+			"taskType": r.task.Type,
+			"allocId":  r.alloc.ID,
+		}).Printf("agent: Not restarting task: %v for alloc: %v ", r.task.Type, r.alloc.ID)
 		if state == models.TaskNotRestarting {
 			r.logger.Debugf("setState restart 1")
 			r.setState(models.TaskStateFailed,
@@ -444,7 +478,11 @@ func (r *Worker) shouldRestart() bool {
 		}
 		return false
 	case models.TaskRestarting:
-		r.logger.Printf("agent: Restarting task %q for alloc %q in %v", r.task.Type, r.alloc.ID, when)
+		r.logger.WithFields(logrus.Fields{
+			"taskType": r.task.Type,
+			"allocId":  r.alloc.ID,
+			"time":     when,
+		}).Printf("agent: Restarting task  for alloc in moment")
 		r.logger.Debugf("setState restart 2")
 		r.setState(models.TaskStatePending,
 			models.NewTaskEvent(models.TaskRestarting).
@@ -466,7 +504,9 @@ func (r *Worker) shouldRestart() bool {
 	destroyed := r.destroy
 	r.destroyLock.Unlock()
 	if destroyed {
-		r.logger.Debugf("agent: Not restarting task: %v because it has been destroyed", r.task.Type)
+		r.logger.WithFields(logrus.Fields{
+			"taskType": r.task.Type,
+		}).Debugf("agent: Not restarting task , because it has been destroyed")
 		r.logger.Debugf("setState restart 3")
 		r.setState(models.TaskStateDead, r.destroyEvent)
 		return false
@@ -504,7 +544,10 @@ func (r *Worker) killTask(killingEvent *models.TaskEvent) {
 	destroySuccess, err := r.handleDestroy()
 	if !destroySuccess {
 		// We couldn't successfully destroy the resource created.
-		r.logger.Errorf("agent: Failed to kill task %q. Resources may have been leaked: %v", r.task.Type, err)
+		r.logger.WithFields(logrus.Fields{
+			"taskType": r.task.Type,
+			"err":      err,
+		}).Errorf("agent: Failed to kill task. Resources may have been leaked")
 	}
 
 	r.runningLock.Lock()
@@ -526,14 +569,16 @@ func (r *Worker) startTask() error {
 	}
 
 	// Run prestart
-	ctx := driver.NewExecContext(r.alloc.Job.ID, r.alloc.Job.Type, r.config.MaxPayload)
+	ctx := &common.ExecContext{r.alloc.Job.ID, r.alloc.Job.Type, r.config.MaxPayload, r.config.StateDir}
 
 	// Start the job
 	handle, err := drv.Start(ctx, r.task)
 	if err != nil {
 		wrapped := fmt.Sprintf("Failed to start task %q for alloc %q: %v",
 			r.task.Type, r.alloc.ID, err)
-		r.logger.Warnf("agent: %s", wrapped)
+		r.logger.WithFields(logrus.Fields{
+			"agent": wrapped,
+		}).Warnf("")
 		return models.WrapRecoverable(wrapped, err)
 
 	}
@@ -563,7 +608,10 @@ func (r *Worker) collectResourceUsageStats(stopCollection <-chan struct{}) {
 			if err != nil {
 				// Check if the driver doesn't implement stats
 				if err.Error() == driver.DriverStatsNotImplemented.Error() {
-					r.logger.Debugf("agent: Driver for task %q in allocation %q doesn't support stats", r.task.Type, r.alloc.ID)
+					r.logger.WithFields(logrus.Fields{
+						"taskType": r.task.Type,
+						"allocId":  r.alloc.ID,
+					}).Debugf("agent: Driver for task  in allocation  doesn't support stats")
 					return
 				}
 
@@ -571,7 +619,10 @@ func (r *Worker) collectResourceUsageStats(stopCollection <-chan struct{}) {
 				// race between the stopCollection channel being closed and calling
 				// Stats on the handle.
 				if !strings.Contains(err.Error(), "connection is shut down") {
-					r.logger.Warnf("agent: Error fetching stats of task %v: %v", r.task.Type, err)
+					r.logger.WithFields(logrus.Fields{
+						"taskType": r.task.Type,
+						"err":      err,
+					}).Warnf("agent: Error fetching stats of task")
 				}
 				continue
 			}
@@ -617,8 +668,12 @@ func (r *Worker) handleDestroy() (destroyed bool, err error) {
 				backoff = killBackoffLimit
 			}
 
-			r.logger.Errorf("agent: Failed to kill task '%s' for alloc %q. Retrying in %v: %v",
-				r.task.Type, r.alloc.ID, backoff, err)
+			r.logger.WithFields(logrus.Fields{
+				"taskType": r.task.Type,
+				"allocId":  r.alloc.ID,
+				"backoff":  backoff,
+				"err":      err,
+			}).Errorf("agent: Failed to kill task  for alloc. Retrying in backoff")
 			time.Sleep(time.Duration(backoff))
 		} else {
 			// Kill was successful
@@ -648,7 +703,11 @@ func (r *Worker) Kill(source, reason string, fail bool) {
 		event.SetFailsTask()
 	}
 
-	r.logger.Debugf("agent: Killing task %v for alloc %q: %v", r.task.Type, r.alloc.ID, reasonStr)
+	r.logger.WithFields(logrus.Fields{
+		"taskType":  r.task.Type,
+		"allocId":   r.alloc.ID,
+		"reasonStr": reason,
+	}).Debugf("agent: Killing task  for alloc")
 	r.Destroy(event)
 }
 
@@ -661,7 +720,11 @@ func (r *Worker) UnblockStart(source string) {
 		return
 	}
 
-	r.logger.Debugf("agent: Unblocking task %v for alloc %q: %v", r.task.Type, r.alloc.ID, source)
+	r.logger.WithFields(logrus.Fields{
+		"taskType": r.task.Type,
+		"allocId":  r.alloc.ID,
+		"source":   source,
+	}).Debugf("agent: Unblocking task for alloc ", r.task.Type, r.alloc.ID, source)
 	r.unblocked = true
 	close(r.unblockCh)
 }

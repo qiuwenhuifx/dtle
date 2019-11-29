@@ -16,7 +16,7 @@ import (
 	usql "github.com/actiontech/dtle/internal/client/driver/mysql/sql"
 	uconf "github.com/actiontech/dtle/internal/config"
 	umconf "github.com/actiontech/dtle/internal/config/mysql"
-	log "github.com/actiontech/dtle/internal/logger"
+	"github.com/sirupsen/logrus"
 )
 
 const startSlavePostWaitMilliseconds = 500 * time.Millisecond
@@ -24,12 +24,12 @@ const startSlavePostWaitMilliseconds = 500 * time.Millisecond
 // Inspector reads data from the read-MySQL-server (typically a replica, but can be the master)
 // It is used for gaining initial status and structure, and later also follow up on progress and changelog
 type Inspector struct {
-	logger       *log.Entry
+	logger       *logrus.Entry
 	db           *gosql.DB
 	mysqlContext *uconf.MySQLDriverConfig
 }
 
-func NewInspector(ctx *uconf.MySQLDriverConfig, logger *log.Entry) *Inspector {
+func NewInspector(ctx *uconf.MySQLDriverConfig, logger *logrus.Entry) *Inspector {
 	return &Inspector{
 		logger:       logger,
 		mysqlContext: ctx,
@@ -121,9 +121,14 @@ func (i *Inspector) ValidateOriginalTable(databaseName, tableName string, table 
 			uniqueKeyIsValid = false
 		}
 
+		// Use the first key or PK (if valid)
 		if uniqueKeyIsValid {
-			table.UseUniqueKey = uk
-			break
+			if uk.IsPrimary() {
+				table.UseUniqueKey = uk
+				break
+			} else if table.UseUniqueKey == nil {
+				table.UseUniqueKey = uk
+			}
 		}
 	}
 	if table.UseUniqueKey == nil {
@@ -273,14 +278,14 @@ func (i *Inspector) validateBinlogs() error {
 
 // validateTable makes sure the table we need to operate on actually exists
 func (i *Inspector) validateTable(databaseName, tableName string) error {
-	query := fmt.Sprintf(`show table status from %s like '%s'`, usql.EscapeName(databaseName), tableName)
+	query := fmt.Sprintf(`show table status from %s like '%s'`, umconf.EscapeName(databaseName), tableName)
 
 	tableFound := false
 	//tableEngine := ""
 	err := usql.QueryRowsMap(i.db, query, func(rowMap usql.RowMap) error {
 		//tableEngine = rowMap.GetString("Engine")
 		if rowMap.GetString("Comment") == "VIEW" {
-			return fmt.Errorf("%s.%s is a VIEW, not a real table. Bailing out", usql.EscapeName(databaseName), usql.EscapeName(tableName))
+			return fmt.Errorf("%s.%s is a VIEW, not a real table. Bailing out", umconf.EscapeName(databaseName), umconf.EscapeName(tableName))
 		}
 		tableFound = true
 
@@ -290,7 +295,7 @@ func (i *Inspector) validateTable(databaseName, tableName string) error {
 		return err
 	}
 	if !tableFound {
-		return fmt.Errorf("Cannot find table %s.%s!", usql.EscapeName(databaseName), usql.EscapeName(tableName))
+		return fmt.Errorf("Cannot find table %s.%s!", umconf.EscapeName(databaseName), umconf.EscapeName(tableName))
 	}
 
 	return nil
@@ -318,7 +323,7 @@ func (i *Inspector) validateTableTriggers(databaseName, tableName string) error 
 		return err
 	}
 	if numTriggers > 0 {
-		return fmt.Errorf("Found triggers on %s.%s. Triggers are not supported at this time. Bailing out", usql.EscapeName(databaseName), usql.EscapeName(tableName))
+		return fmt.Errorf("Found triggers on %s.%s. Triggers are not supported at this time. Bailing out", umconf.EscapeName(databaseName), umconf.EscapeName(tableName))
 	}
 	return nil
 }

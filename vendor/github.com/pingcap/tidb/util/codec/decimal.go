@@ -14,32 +14,30 @@
 package codec
 
 import (
-	"fmt"
-
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/types"
 )
 
 // EncodeDecimal encodes a decimal into a byte slice which can be sorted lexicographically later.
-func EncodeDecimal(b []byte, dec *types.MyDecimal, precision, frac int) []byte {
+func EncodeDecimal(b []byte, dec *types.MyDecimal, precision, frac int) ([]byte, error) {
 	if precision == 0 {
 		precision, frac = dec.PrecisionAndFrac()
 	}
 	b = append(b, byte(precision), byte(frac))
 	bin, err := dec.ToBin(precision, frac)
-	if err != nil {
-		panic(fmt.Sprintf("should not happen, precision %d, frac %d %v", precision, frac, err))
-	}
 	b = append(b, bin...)
-	return b
+	return b, errors.Trace(err)
 }
 
 // DecodeDecimal decodes bytes to decimal.
 func DecodeDecimal(b []byte) ([]byte, *types.MyDecimal, int, int, error) {
-	// gofail: var errorInDecodeDecimal bool
-	// if errorInDecodeDecimal {
-	//	 return b, nil, 0, 0, errors.New("gofail error")
-	// }
+	failpoint.Inject("errorInDecodeDecimal", func(val failpoint.Value) {
+		if val.(bool) {
+			failpoint.Return(b, nil, 0, 0, errors.New("gofail error"))
+		}
+	})
+
 	if len(b) < 3 {
 		return b, nil, 0, 0, errors.New("insufficient bytes to decode value")
 	}
